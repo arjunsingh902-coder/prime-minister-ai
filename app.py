@@ -68,25 +68,41 @@ def home():
 @app.route('/chat', methods=['POST'])
 def chat():
     user_text = request.json.get('msg')
-    gemini_api_key = os.environ.get('GEMINI_API_KEY', '')
+    gemini_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
     
     if not gemini_api_key:
         return jsonify({'reply': '⚠️ अर्जुन भाई, क्लाउड सर्वर पर API Key सेट नहीं है! पहले तिजोरी में चाबी डालें।'})
         
     try:
-        # Google API Call
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": f"System Rule: You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. Respond in Hindi/Hinglish. User message: {user_text}"}]}]
+        # 1. URL से API Key हटाई गई (Java स्टाइल)
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+        
+        # 2. Header में Key भेजी गई (Java स्टाइल)
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": gemini_api_key
         }
-        response = requests.post(url, json=payload, timeout=15)
+        
+        # 3. System Instruction को अलग से डिज़ाइन किया गया
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": "You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. Respond in Hindi/Hinglish."}]
+            },
+            "contents": [
+                {"parts": [{"text": user_text}]}
+            ]
+        }
+        
+        # Timeout बढ़ाकर 30 सेकंड कर दिया गया
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             ai_reply = data['candidates'][0]['content']['parts'][0]['text']
             return jsonify({'reply': ai_reply.strip()})
         else:
-            return jsonify({'reply': f'⚠️ Google API Error: {response.status_code}'})
+            # अगर अब कोई एरर आई, तो सर्वर का असली मैसेज स्क्रीन पर दिखेगा, सिर्फ नंबर नहीं
+            return jsonify({'reply': f'⚠️ Google API Error {response.status_code}: {response.text}'})
             
     except Exception as e:
         return jsonify({'reply': f'⚠️ System Crash: {str(e)}'})
