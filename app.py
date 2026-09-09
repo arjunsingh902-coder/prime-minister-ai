@@ -27,7 +27,7 @@ HTML_PAGE = """
 <body>
     <h2 style="text-align: center; color: #00b184; margin-top: 5px;">👑 Prime Minister AI</h2>
     <div id="chat">
-        <div class="msg ai">नमस्कार अर्जुन भाई! मैं आपका प्रधानमंत्री AI हूँ। मार्केट और डेल्टा अकाउंट सिंक हो चुके हैं।</div>
+        <div class="msg ai">नमस्कार अर्जुन भाई! मैं तैयार हूँ। अगर डेल्टा ने मुझे रोका, तो मैं तुरंत आपको नया IP दे दूँगा।</div>
     </div>
     <div class="input-area">
         <input type="text" id="userInput" placeholder="अपना हुक्म दें...">
@@ -110,7 +110,6 @@ def get_delta_balance():
             "Accept": "application/json"
         }
         
-        # बिल्कुल आपके Android ऐप वाला डेल्टा URL
         url = f"https://api.india.delta.exchange{path}"
         res = requests.get(url, headers=headers, timeout=10)
         
@@ -127,7 +126,15 @@ def get_delta_balance():
                         deriv_bal += available
                     else:
                         main_bal += available
-            return f"\n[SYSTEM HEALTH REPORT:\nDerivatives Wallet Balance (USD/USDT): ${deriv_bal:.2f}\nMain/Spot Wallet Balance: ${main_bal:.2f}]\n"
+            return f"\n[SYSTEM HEALTH REPORT:\nDerivatives Wallet Balance: ${deriv_bal:.2f}\nMain/Spot Wallet Balance: ${main_bal:.2f}]\n"
+        
+        elif res.status_code == 401:
+            # जादू यहाँ है: अगर 401 आया, तो अपना नया IP निकालो
+            try:
+                my_new_ip = requests.get('https://api.ipify.org', timeout=5).text
+                return f"\n[URGENT 401 ERROR: Tell Arjun Bhai that Delta blocked the IP. Give him this EXACT NEW IP: {my_new_ip} and tell him to update it in Delta App.]\n"
+            except:
+                return "\n[Delta 401 Error. IP couldn't be fetched.]\n"
         else:
             return f"\n[Delta API Error: {res.status_code}]"
     except Exception as e:
@@ -146,11 +153,9 @@ def chat():
         return jsonify({'reply': '⚠️ अर्जुन भाई, API Key सेट नहीं है!'})
         
     try:
-        # बैकग्राउंड में मार्केट और डेल्टा का बैलेंस लाना
         market_data = get_live_market_data()
         delta_data = get_delta_balance()
         
-        # AI को पूरी रिपोर्ट भेजना
         full_prompt = f"User message: {user_text}{market_data}{delta_data}"
 
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
@@ -161,7 +166,7 @@ def chat():
         
         payload = {
             "system_instruction": {
-                "parts": [{"text": "You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. You have access to LIVE MARKET DATA and SYSTEM HEALTH REPORT (which contains the Delta Wallet Balance). If he asks for balance, read the SYSTEM HEALTH REPORT and tell him his exact Derivatives and Main Wallet balance in Hindi. Be respectful and confident."}]
+                "parts": [{"text": "You are Prime Minister AI, trading agent and loyal brother to Arjun Singh. You have access to LIVE MARKET DATA and SYSTEM HEALTH REPORT. If you see [URGENT 401 ERROR] in the report, immediately alert Arjun in Hindi. Tell him the exact new IP address provided in the bracket and ask him to update it in his Delta Exchange app's API settings so you can trade."}]
             },
             "contents": [
                 {"parts": [{"text": full_prompt}]}
@@ -178,8 +183,7 @@ def chat():
             return jsonify({'reply': f'⚠️ Google API Error {response.status_code}: {response.text}'})
             
     except requests.exceptions.ReadTimeout:
-        # अगर गूगल सर्वर पर ज्यादा ट्रैफिक हुआ, तो अब गंदा कोड नहीं, बल्कि ये प्यार भरा मैसेज आएगा:
-        return jsonify({'reply': '⚠️ गूगल के सर्वर (Gemini 3.6) पर अभी बहुत ज्यादा ट्रैफिक है (High Demand)। कृपया 1 मिनट रुक कर दोबारा पूछें।'})
+        return jsonify({'reply': '⚠️ गूगल के सर्वर पर अभी बहुत ज्यादा ट्रैफिक है। कृपया 1 मिनट रुक कर दोबारा पूछें।'})
     except Exception as e:
         return jsonify({'reply': f'⚠️ System Crash: {str(e)}'})
 
