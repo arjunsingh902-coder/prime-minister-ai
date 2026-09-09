@@ -75,7 +75,7 @@ def chat():
         
     try:
         # Google API Call
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_api_key}"
         payload = {
             "contents": [{"parts": [{"text": f"System Rule: You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. Respond in Hindi/Hinglish. User message: {user_text}"}]}]
         }
