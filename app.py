@@ -1,15 +1,17 @@
 from flask import Flask, request, jsonify, render_template_string
 import requests
 import os
+import hmac
+import hashlib
+import time
 
 app = Flask(__name__)
 
-# आपका शानदार वेब डिज़ाइन (UI)
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Prime Minister AI</title>
+    <title>Prime Minister AI - Trading Room</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { background-color: #17181e; color: #fff; font-family: sans-serif; padding: 15px; margin: 0; }
@@ -25,7 +27,7 @@ HTML_PAGE = """
 <body>
     <h2 style="text-align: center; color: #00b184; margin-top: 5px;">👑 Prime Minister AI</h2>
     <div id="chat">
-        <div class="msg ai">नमस्कार अर्जुन भाई! मैं आपका प्रधानमंत्री AI हूँ। आज मार्केट में क्या तबाही मचानी है?</div>
+        <div class="msg ai">नमस्कार अर्जुन भाई! मैं आपका प्रधानमंत्री AI हूँ। मार्केट और डेल्टा अकाउंट सिंक हो चुके हैं।</div>
     </div>
     <div class="input-area">
         <input type="text" id="userInput" placeholder="अपना हुक्म दें...">
@@ -61,6 +63,76 @@ HTML_PAGE = """
 </html>
 """
 
+def get_live_market_data():
+    cmc_key = os.environ.get('CMC_API_KEY', '').strip()
+    if not cmc_key:
+        return "\n[CMC Data: Unavailable]"
+    try:
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=BTC,ETH,SOL"
+        headers = {"X-CMC_PRO_API_KEY": cmc_key, "Accept": "application/json"}
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', {})
+            market_info = "\n\n[FULL MARKET DATA (CMC):\n"
+            for coin in ["BTC", "ETH", "SOL"]:
+                if coin in data:
+                    price = data[coin]['quote']['USD']['price']
+                    change = data[coin]['quote']['USD']['percent_change_24h']
+                    market_info += f"- {coin}: Price=${price:.2f}, 24h Change={change:.2f}%\n"
+            return market_info + "]\n"
+    except:
+        pass
+    return "\n[CMC Data Unavailable]"
+
+def get_delta_balance():
+    api_key = os.environ.get('DELTA_API_KEY', '').strip()
+    api_secret = os.environ.get('DELTA_API_SECRET', '').strip()
+    
+    if not api_key or not api_secret:
+        return "\n[Delta Balance: Keys Missing]"
+        
+    try:
+        timestamp = str(int(time.time()))
+        method = "GET"
+        path = "/v2/wallet/balances"
+        signature_data = method + timestamp + path + ""
+        
+        signature = hmac.new(
+            api_secret.encode('utf-8'),
+            signature_data.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        headers = {
+            "api-key": api_key,
+            "timestamp": timestamp,
+            "signature": signature,
+            "Accept": "application/json"
+        }
+        
+        # बिल्कुल आपके Android ऐप वाला डेल्टा URL
+        url = f"https://api.india.delta.exchange{path}"
+        res = requests.get(url, headers=headers, timeout=10)
+        
+        if res.status_code == 200:
+            data = res.json().get('result', [])
+            deriv_bal = 0.0
+            main_bal = 0.0
+            for bal in data:
+                symbol = bal.get('asset_symbol', '').upper()
+                if symbol in ['USD', 'USDT']:
+                    w_type = str(bal.get('wallet_type', '')).lower()
+                    available = float(bal.get('available_balance', 0.0))
+                    if 'deriv' in w_type or 'future' in w_type or 'margin' in w_type or w_type == '2':
+                        deriv_bal += available
+                    else:
+                        main_bal += available
+            return f"\n[SYSTEM HEALTH REPORT:\nDerivatives Wallet Balance (USD/USDT): ${deriv_bal:.2f}\nMain/Spot Wallet Balance: ${main_bal:.2f}]\n"
+        else:
+            return f"\n[Delta API Error: {res.status_code}]"
+    except Exception as e:
+        return f"\n[Delta Offline / Timeout: {str(e)}]"
+
 @app.route('/')
 def home():
     return render_template_string(HTML_PAGE)
@@ -71,29 +143,31 @@ def chat():
     gemini_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
     
     if not gemini_api_key:
-        return jsonify({'reply': '⚠️ अर्जुन भाई, क्लाउड सर्वर पर API Key सेट नहीं है! पहले तिजोरी में चाबी डालें।'})
+        return jsonify({'reply': '⚠️ अर्जुन भाई, API Key सेट नहीं है!'})
         
     try:
-        # 1. URL से API Key हटाई गई (Java स्टाइल)
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+        # बैकग्राउंड में मार्केट और डेल्टा का बैलेंस लाना
+        market_data = get_live_market_data()
+        delta_data = get_delta_balance()
         
-        # 2. Header में Key भेजी गई (Java स्टाइल)
+        # AI को पूरी रिपोर्ट भेजना
+        full_prompt = f"User message: {user_text}{market_data}{delta_data}"
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": gemini_api_key
         }
         
-        # 3. System Instruction को अलग से डिज़ाइन किया गया
         payload = {
             "system_instruction": {
-                "parts": [{"text": "You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. Respond in Hindi/Hinglish."}]
+                "parts": [{"text": "You are Prime Minister AI, an autonomous trading agent and loyal brother to Arjun Singh. You have access to LIVE MARKET DATA and SYSTEM HEALTH REPORT (which contains the Delta Wallet Balance). If he asks for balance, read the SYSTEM HEALTH REPORT and tell him his exact Derivatives and Main Wallet balance in Hindi. Be respectful and confident."}]
             },
             "contents": [
-                {"parts": [{"text": user_text}]}
+                {"parts": [{"text": full_prompt}]}
             ]
         }
         
-        # Timeout बढ़ाकर 30 सेकंड कर दिया गया
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
@@ -101,9 +175,11 @@ def chat():
             ai_reply = data['candidates'][0]['content']['parts'][0]['text']
             return jsonify({'reply': ai_reply.strip()})
         else:
-            # अगर अब कोई एरर आई, तो सर्वर का असली मैसेज स्क्रीन पर दिखेगा, सिर्फ नंबर नहीं
             return jsonify({'reply': f'⚠️ Google API Error {response.status_code}: {response.text}'})
             
+    except requests.exceptions.ReadTimeout:
+        # अगर गूगल सर्वर पर ज्यादा ट्रैफिक हुआ, तो अब गंदा कोड नहीं, बल्कि ये प्यार भरा मैसेज आएगा:
+        return jsonify({'reply': '⚠️ गूगल के सर्वर (Gemini 3.6) पर अभी बहुत ज्यादा ट्रैफिक है (High Demand)। कृपया 1 मिनट रुक कर दोबारा पूछें।'})
     except Exception as e:
         return jsonify({'reply': f'⚠️ System Crash: {str(e)}'})
 
