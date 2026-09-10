@@ -22,7 +22,7 @@ STATE_FILE = "bot_state.json"
 API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/3.0-Pro"
+USER_AGENT = "PrimeMinisterAI/3.1-Pro"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -43,14 +43,11 @@ SYMBOLS = [
 # ============================================================
 
 lock = threading.RLock()
-engine_thread = None
-engine_stop = threading.Event()
-
 product_cache = {}
 
 runtime = {
     "started_at": None,
-    "last_scan": None,
+    "last_scan": 0,
     "last_scan_error": None,
     "public_ip": None,
 }
@@ -66,7 +63,7 @@ def default_coin_state():
         "quantity": 1,
         "leverage": 2,
         "rules": {},
-        "armed_signal": None,  # Holds pending trigger logic
+        "armed_signal": None,  
         "last_signal": {
             "side": "NO_TRADE",
             "score": 0,
@@ -266,12 +263,12 @@ def calculate_signal(candles_5m, trend_1h):
 
     ls, ss, rl, rs = 0, 0, [], []
 
-    # 1. Trend Align (Professional HTF Filter)
+    # 1. Trend Align
     if trend_1h == "UP": ls += 20; rl.append("1H Trend UP")
     elif trend_1h == "DOWN": ss += 20; rs.append("1H Trend DOWN")
     else: rl.append("1H Trend Flat"); rs.append("1H Trend Flat")
 
-    # 2. LTF Momentum & EMAs
+    # 2. Momentum
     if ema9 > ema21: ls += 20; rl.append("5M EMA Bullish")
     elif ema9 < ema21: ss += 20; rs.append("5M EMA Bearish")
 
@@ -297,7 +294,6 @@ def calculate_signal(candles_5m, trend_1h):
         if ls > ss: ls += 15; rl.append("High Vol")
         elif ss > ls: ss += 15; rs.append("High Vol")
 
-    # CALCULATE TARGET TRIGGER PRICE (Last 3 candles extreme)
     recent_high = max(x["high"] for x in candles_5m[-4:-1])
     recent_low = min(x["low"] for x in candles_5m[-4:-1])
 
@@ -366,7 +362,6 @@ def execute_trade(symbol, mode, armed_data):
                 "highest_price": entry_price, "lowest_price": entry_price, "mode": mode,
                 "exchange_order": result, "opened_at": datetime.now(timezone.utc).isoformat(), "reason": armed_data["reason"],
             }
-            # Clear Armed Status
             state["coins"][symbol]["armed_signal"] = None
         
         save_state()
@@ -424,14 +419,13 @@ def close_trade(price, reason):
 
 
 # ============================================================
-# MASTER SCANNER & ENGINE
+# MASTER SCANNER (ALWAYS RUNNING)
 # ============================================================
 
 def scan_all_coins():
     results = {}
     for symbol in SYMBOLS:
         try:
-            # 1H HTF for Trend
             candles_1h = get_candles(symbol, "1h", CANDLE_LIMIT_HTF)
             trend_1h = "NEUTRAL"
             if len(candles_1h) > 21:
@@ -439,20 +433,20 @@ def scan_all_coins():
                 e9, e21 = ema(c1h, 9), ema(c1h, 21)
                 if e9 and e21: trend_1h = "UP" if e9 > e21 else "DOWN"
 
-            # 5M LTF for Signals
             candles_5m = get_candles(symbol, "5m", CANDLE_LIMIT_LTF)
             signal = calculate_signal(candles_5m, trend_1h)
             
             with lock: state["coins"][symbol]["last_signal"] = signal
             results[symbol] = signal
         except Exception as exc:
-            with lock: state["coins"][symbol]["last_signal"] = {"side": "NO_TRADE", "score": 0, "price": None, "reason": f"Scan Error: {exc}"}
+            with lock: state["coins"][symbol]["last_signal"] = {"side": "NO_TRADE", "score": 0, "price": None, "reason": f"Scan Error"}
+            raise exc # Pass to outer loop for event logging
     save_state()
     return results
 
 def trading_cycle():
-    runtime["last_scan"] = datetime.now(timezone.utc).isoformat()
     try:
+        # SCANNING ALWAYS HAPPENS - Regardless of System ON/OFF
         signals = scan_all_coins()
         runtime["last_scan_error"] = None 
 
@@ -461,6 +455,7 @@ def trading_cycle():
             manage_active_trade()
             return
 
+        # EXECUTION ONLY HAPPENS IF SYSTEM IS ON AND COIN IS ARMED
         with lock: system_on, selected = bool(state["system_on"]), state["selected_coin"]
         if not system_on or selected not in SYMBOLS: return
         
@@ -470,7 +465,6 @@ def trading_cycle():
         armed_data = coin_data.get("armed_signal")
         if not armed_data: return
 
-        # EXPIRY LOGIC (20 Mins Anti-FOMO)
         if time.time() > armed_data["expiry_time"]:
             with lock:
                 state["coins"][selected]["enabled"] = False
@@ -480,7 +474,6 @@ def trading_cycle():
             event(f"⏳ {selected} {armed_data['side']} Signal EXPIRED. Momentum Lost. System Disarmed.")
             return
 
-        # PENDING TRIGGER LOGIC
         current_price = signals[selected].get("price")
         if not current_price: return
 
@@ -493,31 +486,14 @@ def trading_cycle():
 
     except Exception as exc:
         runtime["last_scan_error"] = str(exc)
-        event(f"Trading Error (Check API/IP): {exc}")
 
 def engine_loop():
-    event("🟢 Professional Trading Engine Started")
-    while not engine_stop.is_set():
+    event("🟢 Background Scanner Engine Started. Fetching Market Data...")
+    while True:
         started = time.time()
         trading_cycle()
-        engine_stop.wait(max(0.5, SCAN_SECONDS - (time.time() - started)))
-    event("🔴 Trading Engine Stopped")
-
-def start_engine():
-    global engine_thread
-    with lock:
-        if not state["system_on"]: return False, "System is OFF"
-        if state["selected_coin"] not in SYMBOLS: return False, "Select a coin first"
-        if not state["coins"][state["selected_coin"]]["enabled"]: return False, "Coin is not ARMED"
-    if engine_thread and engine_thread.is_alive(): return True, "Already running"
-    engine_stop.clear()
-    engine_thread = threading.Thread(target=engine_loop, daemon=True)
-    engine_thread.start()
-    return True, "Engine started"
-
-def stop_engine():
-    engine_stop.set()
-    return True, "Engine stopping"
+        runtime["last_scan"] = time.time()
+        time.sleep(max(0.5, SCAN_SECONDS - (time.time() - started)))
 
 
 # ============================================================
@@ -528,7 +504,7 @@ def stop_engine():
 def api_state():
     with lock: snapshot = json.loads(json.dumps(state))
     snapshot["runtime"] = runtime
-    snapshot["engine_running"] = bool(engine_thread and engine_thread.is_alive())
+    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15) # True if scanned in last 15s
     return jsonify(snapshot)
 
 @app.get("/api/coin/<symbol>/rules")
@@ -556,14 +532,13 @@ def api_coin_toggle(symbol):
             if signal["side"] == "NO_TRADE":
                 return jsonify({"success": False, "error": "Cannot Arm: No valid signal right now."}), 400
             
-            # ARM THE COIN (Pending Trigger Setup)
             for other in SYMBOLS: state["coins"][other]["enabled"] = (other == symbol.upper())
             state["selected_coin"] = symbol.upper()
             state["coins"][symbol.upper()]["enabled"] = True
             state["coins"][symbol.upper()]["armed_signal"] = {
                 "side": signal["side"],
                 "trigger_price": signal["trigger_price"],
-                "expiry_time": time.time() + (20 * 60), # 20 Minutes Expiry
+                "expiry_time": time.time() + (20 * 60),
                 "atr": signal["atr"],
                 "reason": signal["reason"]
             }
@@ -580,9 +555,9 @@ def api_coin_toggle(symbol):
 def api_system():
     enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
     with lock: state["system_on"] = enabled
-    if enabled: start_engine()
-    else: stop_engine()
     save_state()
+    if enabled: event("⚡ SYSTEM ON: Execution Engine Active (Will fire if Armed Coin triggers)")
+    else: event("⏸️ SYSTEM OFF: Execution Engine Paused")
     return jsonify({"success": True})
 
 @app.post("/api/mode")
@@ -691,6 +666,13 @@ button:hover { background: #172b43; }
             <button onclick="manualClose()">CLOSE CURRENT TRADE</button>
         </div>
     </div>
+    
+    <div class="section">
+        <div class="panel">
+            <div class="label">CONNECTIONS & HEALTH</div>
+            <div id="connections" style="margin-top:12px"></div>
+        </div>
+    </div>
 
     <div class="section">
         <div class="panel">
@@ -787,6 +769,11 @@ function render(state) {
     system.className = "value " + (state.system_on ? "green" : "gray");
     document.getElementById("mode").innerText = state.mode;
     document.getElementById("selected").innerText = state.selected_coin || "None";
+    
+    document.getElementById("connections").innerHTML = `
+        <div class="rule"><span>Delta API Connection</span><span class="${state.runtime.last_scan_error ? 'red' : 'green'}">${state.runtime.last_scan_error ? 'ERROR' : 'CONNECTED & READY'}</span></div>
+        <div class="rule"><span>Background Scanner</span><span class="${state.engine_running ? 'green' : 'red'}">${state.engine_running ? 'SCANNING LIVE' : 'STOPPED/LOADING'}</span></div>
+    `;
 
     const coins = document.getElementById("coins");
     coins.innerHTML = "";
@@ -862,8 +849,8 @@ function renderEvents(state) {
         div.className = "event-item";
         if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed")) div.style.color = "#ff6577";
         else if (item.message.includes("Trailing Stop")) div.style.color = "#ffc857";
-        else if (item.message.includes("EXECUTED") || item.message.includes("ARMED")) div.style.color = "#45e09b";
-        else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED")) div.style.color = "#8294aa";
+        else if (item.message.includes("EXECUTED") || item.message.includes("ARMED") || item.message.includes("Started")) div.style.color = "#45e09b";
+        else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED") || item.message.includes("Paused")) div.style.color = "#8294aa";
         
         div.innerText = `${item.time.split('T')[1].slice(0,8)} — ${item.message}`;
         box.appendChild(div);
@@ -985,6 +972,7 @@ def index():
 def startup():
     get_public_ip()
     threading.Thread(target=ip_updater_loop, daemon=True).start()
+    threading.Thread(target=engine_loop, daemon=True).start()
 
 startup()
 
