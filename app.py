@@ -350,11 +350,10 @@ def calculate_signal(candles):
 
 
 # ============================================================
-# IP TRACKER (UPDATED - Bulletproof Render Fix)
+# IP TRACKER
 # ============================================================
 
 def get_public_ip():
-    # 4 Backup APIs to guarantee IP loading
     services = [
         ("https://api.ipify.org?format=json", True),
         ("https://icanhazip.com", False),
@@ -366,8 +365,6 @@ def get_public_ip():
         try:
             res = requests.get(url, timeout=5)
             ip = res.json().get("ip") if is_json else res.text.strip()
-            
-            # Simple check to make sure it's an actual IP address
             if ip and "." in ip:
                 runtime["public_ip"] = ip
                 return
@@ -1048,7 +1045,9 @@ def startup():
     get_public_ip()
     threading.Thread(target=ip_updater_loop, daemon=True).start()
 
+# FIX: Yahan 'startup()' ko call kiya hai taaki Gunicorn server isko chala sake!
+startup()
+
 if __name__ == "__main__":
-    startup()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
