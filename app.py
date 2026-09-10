@@ -350,14 +350,32 @@ def calculate_signal(candles):
 
 
 # ============================================================
-# IP TRACKER
+# IP TRACKER (UPDATED - Bulletproof Render Fix)
 # ============================================================
 
 def get_public_ip():
-    try:
-        response = requests.get("https://api.ipify.org?format=json", timeout=5)
-        runtime["public_ip"] = response.json().get("ip")
-    except Exception: pass
+    # 4 Backup APIs to guarantee IP loading
+    services = [
+        ("https://api.ipify.org?format=json", True),
+        ("https://icanhazip.com", False),
+        ("https://ident.me", False),
+        ("https://ifconfig.me/ip", False)
+    ]
+    
+    for url, is_json in services:
+        try:
+            res = requests.get(url, timeout=5)
+            ip = res.json().get("ip") if is_json else res.text.strip()
+            
+            # Simple check to make sure it's an actual IP address
+            if ip and "." in ip:
+                runtime["public_ip"] = ip
+                return
+        except Exception:
+            continue
+            
+    if not runtime.get("public_ip"):
+        runtime["public_ip"] = "Error Loading IP"
 
 def ip_updater_loop():
     while True:
