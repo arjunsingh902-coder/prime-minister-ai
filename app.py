@@ -9,17 +9,26 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify, request, render_template_string
 
+
+# ============================================================
+# PRIME MINISTER AI — DELTA COMMANDER
+# ============================================================
+
 app = Flask(__name__)
 
 DELTA_BASE = "https://api.india.delta.exchange"
 STATE_FILE = "bot_state.json"
 
-API_KEY = os.getenv("DELTA_API_KEY", "")
-API_SECRET = os.getenv("DELTA_API_SECRET", "")
+API_KEY = os.getenv("DELTA_API_KEY", "").strip()
+API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
+CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/1.1"
-SCAN_INTERVAL = 5
+USER_AGENT = "PrimeMinisterAI/1.0"
+
+SCAN_SECONDS = 5
+CMC_CACHE_SECONDS = 30 * 60
 PRODUCT_CACHE_SECONDS = 60
+CANDLE_LIMIT = 160
 
 SYMBOLS = [
     "BTCUSD",
@@ -29,154 +38,149 @@ SYMBOLS = [
     "DOGEUSD",
 ]
 
-DEFAULT_COIN_CONFIG = {
-    symbol: {
-        "enabled": False,
-        "quantity": None,
-        "leverage": None,
-        "rules": {},
-        "last_signal": None,
-    }
-    for symbol in SYMBOLS
-}
-
-DEFAULT_STATE = {
-    "enabled": False,
-    "mode": "PAPER",
-    "timeframe": "5m",
-    "symbols": SYMBOLS,
-    "adaptive_target": True,
-    "auto_trailing": True,
-    "coins": DEFAULT_COIN_CONFIG,
-    "trade": None,
-    "last_signal": None,
-    "events": [],
-    "last_ip": None,
-}
+RESOLUTION = "5m"
 
 
-state_lock = threading.RLock()
+# ============================================================
+# GLOBAL RUNTIME
+# ============================================================
+
+lock = threading.RLock()
 engine_thread = None
+engine_stop = threading.Event()
 
 product_cache = {}
-product_cache_time = 0
-product_cache_lock = threading.Lock()
+cmc_cache = {
+    "timestamp": 0,
+    "data": {},
+    "error": None,
+}
+
+runtime = {
+    "started_at": None,
+    "last_scan": None,
+    "last_scan_error": None,
+    "public_ip": None,
+}
 
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+# ============================================================
+# DEFAULT STATE
+# ============================================================
+
+def default_coin_state():
+    return {
+        "enabled": False,
+        "quantity": 1,
+        "leverage": 2,
+        "rules": {},
+        "last_signal": {
+            "side": "NO_TRADE",
+            "score": 0,
+            "price": None,
+            "reason": "Waiting for market data",
+            "updated_at": None,
+        },
+    }
 
 
-def deep_copy(value):
-    return json.loads(json.dumps(value))
-
-
-def build_default_state():
-    return deep_copy(DEFAULT_STATE)
+def default_state():
+    return {
+        "system_on": False,
+        "selected_coin": None,
+        "mode": "PAPER",
+        "current_trade": None,
+        "events": [],
+        "coins": {
+            symbol: default_coin_state()
+            for symbol in SYMBOLS
+        },
+    }
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return build_default_state()
+        return default_state()
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
+            state = json.load(f)
 
-        state = build_default_state()
+        base = default_state()
 
-        if isinstance(saved, dict):
-            state.update(saved)
+        for key in base:
+            if key not in state:
+                state[key] = base[key]
 
-        if not isinstance(state.get("coins"), dict):
-            state["coins"] = deep_copy(DEFAULT_COIN_CONFIG)
+        if "coins" not in state:
+            state["coins"] = base["coins"]
 
         for symbol in SYMBOLS:
             if symbol not in state["coins"]:
-                state["coins"][symbol] = deep_copy(
-                    DEFAULT_COIN_CONFIG[symbol]
-                )
+                state["coins"][symbol] = default_coin_state()
 
-        state["symbols"] = SYMBOLS
+            coin = state["coins"][symbol]
+
+            for key, value in default_coin_state().items():
+                if key not in coin:
+                    coin[key] = value
 
         return state
 
     except Exception:
-        return build_default_state()
+        return default_state()
 
 
 state = load_state()
 
 
 def save_state():
-    with state_lock:
-        temporary = STATE_FILE + ".tmp"
+    with lock:
+        tmp = STATE_FILE + ".tmp"
 
-        with open(
-            temporary,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                state,
-                f,
-                indent=2,
-            )
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
 
-        os.replace(
-            temporary,
-            STATE_FILE,
+        os.replace(tmp, STATE_FILE)
+
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+def event(message):
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    with lock:
+        state["events"].insert(
+            0,
+            {
+                "time": timestamp,
+                "message": message,
+            },
         )
 
-
-def add_event(message):
-    event = {
-        "time": utc_now(),
-        "message": str(message),
-    }
-
-    with state_lock:
-        state.setdefault("events", [])
-        state["events"].insert(0, event)
-        state["events"] = state["events"][:150]
+        state["events"] = state["events"][:100]
 
     save_state()
 
 
-def public_ip():
-    try:
-        response = requests.get(
-            "https://api.ipify.org",
-            timeout=5,
-            headers={
-                "User-Agent": USER_AGENT,
-            },
-        )
+# ============================================================
+# DELTA SIGNING
+# ============================================================
 
-        response.raise_for_status()
-
-        return response.text.strip()
-
-    except Exception:
-        return None
-
-
-def delta_signature(
-    method,
-    path,
-    timestamp,
-    body="",
-):
-    payload = (
-        f"{method.upper()}"
-        f"{timestamp}"
-        f"{path}"
-        f"{body}"
+def delta_signature(method, timestamp, path, query_string="", body=""):
+    message = (
+        method.upper()
+        + str(timestamp)
+        + path
+        + query_string
+        + body
     )
 
     return hmac.new(
-        API_SECRET.encode(),
-        payload.encode(),
+        API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
@@ -191,8 +195,9 @@ def delta_request(
 ):
     url = DELTA_BASE + path
 
-    body_text = ""
+    params = params or {}
 
+    body_text = ""
     if body is not None:
         body_text = json.dumps(
             body,
@@ -201,27 +206,43 @@ def delta_request(
 
     headers = {
         "User-Agent": USER_AGENT,
-        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
+
+    if body is not None:
+        headers["Content-Type"] = "application/json"
 
     if authenticated:
         if not API_KEY or not API_SECRET:
             raise RuntimeError(
-                "Delta API credentials are not configured."
+                "DELTA_API_KEY / DELTA_API_SECRET not configured"
             )
 
         timestamp = str(int(time.time()))
+
+        query_string = ""
+
+        if params:
+            parts = []
+            for key in sorted(params.keys()):
+                parts.append(
+                    f"{key}={params[key]}"
+                )
+            query_string = "&".join(parts)
+
+        signature = delta_signature(
+            method,
+            timestamp,
+            path,
+            query_string,
+            body_text,
+        )
 
         headers.update(
             {
                 "api-key": API_KEY,
                 "timestamp": timestamp,
-                "signature": delta_signature(
-                    method,
-                    path,
-                    timestamp,
-                    body_text,
-                ),
+                "signature": signature,
             }
         )
 
@@ -229,41 +250,41 @@ def delta_request(
         method=method.upper(),
         url=url,
         params=params,
-        data=(
-            body_text
-            if body is not None
-            else None
-        ),
+        data=body_text if body is not None else None,
         headers=headers,
         timeout=timeout,
     )
 
+    try:
+        data = response.json()
+    except Exception:
+        data = {
+            "success": False,
+            "error": response.text,
+        }
+
     if response.status_code >= 400:
         raise RuntimeError(
-            f"Delta API {response.status_code}: "
-            f"{response.text[:700]}"
+            f"Delta HTTP {response.status_code}: "
+            f"{data}"
         )
 
-    try:
-        return response.json()
-    except Exception:
-        return {}
+    return data
 
 
-def get_products(force=False):
-    global product_cache
-    global product_cache_time
+# ============================================================
+# DELTA PRODUCTS
+# ============================================================
 
+def get_products():
     now = time.time()
 
-    with product_cache_lock:
-        if (
-            not force
-            and product_cache
-            and now - product_cache_time
-            < PRODUCT_CACHE_SECONDS
-        ):
-            return product_cache
+    if (
+        product_cache.get("all")
+        and now - product_cache["all"]["time"]
+        < PRODUCT_CACHE_SECONDS
+    ):
+        return product_cache["all"]["data"]
 
     data = delta_request(
         "GET",
@@ -271,43 +292,35 @@ def get_products(force=False):
         authenticated=False,
     )
 
-    result = data.get("result", [])
+    products = data.get("result", [])
 
-    products = {}
-
-    if isinstance(result, list):
-        for product in result:
-            if not isinstance(product, dict):
-                continue
-
-            symbol = str(
-                product.get("symbol", "")
-            ).upper()
-
-            if symbol:
-                products[symbol] = product
-
-    with product_cache_lock:
-        product_cache = products
-        product_cache_time = now
+    product_cache["all"] = {
+        "time": now,
+        "data": products,
+    }
 
     return products
 
 
 def find_product(symbol):
-    products = get_products()
+    symbol = symbol.upper()
 
-    return products.get(
-        str(symbol).upper()
-    )
+    try:
+        products = get_products()
+
+        for product in products:
+            if str(product.get("symbol", "")).upper() == symbol:
+                return product
+
+    except Exception as exc:
+        event(f"{symbol}: product lookup failed: {exc}")
+
+    return None
 
 
-def first_number(data, keys):
-    for key in keys:
-        if key not in data:
-            continue
-
-        value = data.get(key)
+def extract_number(product, names, default=None):
+    for name in names:
+        value = product.get(name)
 
         if value is None:
             continue
@@ -315,524 +328,338 @@ def first_number(data, keys):
         try:
             return float(value)
         except Exception:
-            continue
+            pass
 
-    return None
-
-
-def first_value(data, keys):
-    for key in keys:
-        if key in data and data.get(key) is not None:
-            return data.get(key)
-
-    return None
+    return default
 
 
-def normalise_product_rules(product):
+def product_rules(symbol):
+    product = find_product(symbol)
+
     if not product:
         return {
+            "symbol": symbol,
             "available": False,
-            "message": "Product not found on Delta.",
+            "message": "Delta product information unavailable",
         }
 
-    minimum_quantity = first_number(
+    min_qty = extract_number(
         product,
         [
             "min_order_size",
             "minimum_order_size",
-            "min_size",
-            "minimum_size",
             "order_min_size",
+            "min_size",
         ],
+        None,
     )
 
-    maximum_quantity = first_number(
+    max_qty = extract_number(
         product,
         [
             "max_order_size",
             "maximum_order_size",
-            "max_size",
-            "maximum_size",
             "order_max_size",
+            "max_size",
         ],
+        None,
     )
 
-    quantity_step = first_number(
+    step = extract_number(
         product,
         [
             "order_size_increment",
             "size_increment",
-            "lot_size",
-            "quantity_step",
-            "size_step",
+            "step_size",
         ],
+        None,
     )
 
-    minimum_leverage = first_number(
+    min_leverage = extract_number(
         product,
         [
             "min_leverage",
             "minimum_leverage",
         ],
+        1,
     )
 
-    maximum_leverage = first_number(
+    max_leverage = extract_number(
         product,
         [
             "max_leverage",
             "maximum_leverage",
             "leverage",
         ],
+        None,
     )
 
-    product_id = first_value(
+    default_leverage = extract_number(
         product,
         [
-            "id",
-            "product_id",
+            "default_leverage",
         ],
-    )
-
-    trading_status = first_value(
-        product,
-        [
-            "state",
-            "status",
-            "trading_status",
-        ],
+        None,
     )
 
     return {
         "available": True,
-        "product_id": product_id,
+        "id": product.get("id"),
         "symbol": product.get("symbol"),
-        "description": product.get(
-            "description"
+        "description": product.get("description"),
+        "contract_value": product.get("contract_value"),
+        "tick_size": product.get("tick_size"),
+        "trading_status": product.get("trading_status"),
+        "min_quantity": min_qty,
+        "max_quantity": max_qty,
+        "quantity_step": step,
+        "min_leverage": min_leverage,
+        "max_leverage": max_leverage,
+        "default_leverage": default_leverage,
+        "max_leverage_notional": product.get(
+            "max_leverage_notional"
         ),
-        "contract_type": product.get(
-            "contract_type"
-        ),
-        "settling_asset": product.get(
-            "settling_asset"
-        ),
-        "quoting_asset": product.get(
-            "quoting_asset"
-        ),
-        "underlying_asset": product.get(
-            "underlying_asset"
-        ),
-        "contract_value": product.get(
-            "contract_value"
-        ),
-        "minimum_quantity": minimum_quantity,
-        "maximum_quantity": maximum_quantity,
-        "quantity_step": quantity_step,
-        "minimum_leverage": minimum_leverage,
-        "maximum_leverage": maximum_leverage,
-        "trading_status": trading_status,
         "raw": product,
     }
 
 
-def get_all_coin_rules(force=False):
-    products = get_products(force=force)
+# ============================================================
+# LEVERAGE
+# ============================================================
 
-    result = {}
-
-    for symbol in SYMBOLS:
-        product = products.get(symbol)
-
-        result[symbol] = normalise_product_rules(
-            product
-        )
-
-    return result
-
-
-def validate_coin_settings(
-    symbol,
-    quantity,
-    leverage,
-):
+def set_delta_leverage(symbol, leverage):
     product = find_product(symbol)
 
     if not product:
-        return False, (
-            f"{symbol}: Delta product not found."
+        raise RuntimeError(
+            f"{symbol}: Delta product not found"
         )
 
-    rules = normalise_product_rules(
-        product
-    )
+    product_id = product.get("id")
 
-    try:
-        quantity = float(quantity)
-    except Exception:
-        return False, (
-            f"{symbol}: invalid quantity."
+    if product_id is None:
+        raise RuntimeError(
+            f"{symbol}: Delta product ID missing"
         )
 
-    try:
-        leverage = float(leverage)
-    except Exception:
-        return False, (
-            f"{symbol}: invalid leverage."
-        )
-
-    minimum_quantity = rules.get(
-        "minimum_quantity"
-    )
-
-    maximum_quantity = rules.get(
-        "maximum_quantity"
-    )
-
-    quantity_step = rules.get(
-        "quantity_step"
-    )
-
-    minimum_leverage = rules.get(
-        "minimum_leverage"
-    )
-
-    maximum_leverage = rules.get(
-        "maximum_leverage"
-    )
-
-    if quantity <= 0:
-        return False, (
-            f"{symbol}: quantity must be greater than 0."
-        )
-
-    if leverage <= 0:
-        return False, (
-            f"{symbol}: leverage must be greater than 0."
-        )
-
-    if (
-        minimum_quantity is not None
-        and quantity < minimum_quantity
-    ):
-        return False, (
-            f"{symbol}: quantity {quantity} "
-            f"is below Delta minimum "
-            f"{minimum_quantity}."
-        )
-
-    if (
-        maximum_quantity is not None
-        and quantity > maximum_quantity
-    ):
-        return False, (
-            f"{symbol}: quantity {quantity} "
-            f"exceeds Delta maximum "
-            f"{maximum_quantity}."
-        )
-
-    if quantity_step:
-        minimum_base = (
-            minimum_quantity
-            if minimum_quantity is not None
-            else 0
-        )
-
-        steps = (
-            quantity - minimum_base
-        ) / quantity_step
-
-        if abs(
-            steps - round(steps)
-        ) > 1e-8:
-            return False, (
-                f"{symbol}: quantity must "
-                f"follow Delta quantity step "
-                f"{quantity_step}."
-            )
-
-    if (
-        minimum_leverage is not None
-        and leverage < minimum_leverage
-    ):
-        return False, (
-            f"{symbol}: leverage {leverage} "
-            f"is below Delta minimum "
-            f"{minimum_leverage}."
-        )
-
-    if (
-        maximum_leverage is not None
-        and leverage > maximum_leverage
-    ):
-        return False, (
-            f"{symbol}: leverage {leverage} "
-            f"exceeds Delta maximum "
-            f"{maximum_leverage}."
-        )
-
-    return True, "OK"
-
-
-def get_ticker(symbol):
-    data = delta_request(
-        "GET",
-        "/v2/tickers",
-        params={
-            "symbol": symbol,
-        },
-        authenticated=False,
-    )
-
-    result = data.get("result", [])
-
-    if isinstance(result, list):
-        return (
-            result[0]
-            if result
-            else {}
-        )
-
-    if isinstance(result, dict):
-        return result
-
-    return {}
-
-
-def resolution_seconds(resolution):
-    values = {
-        "1m": 60,
-        "3m": 180,
-        "5m": 300,
-        "15m": 900,
-        "30m": 1800,
-        "1h": 3600,
-        "2h": 7200,
-        "4h": 14400,
-        "6h": 21600,
-        "1d": 86400,
+    body = {
+        "leverage": int(leverage),
     }
 
-    return values.get(
-        resolution,
-        300,
+    return delta_request(
+        "POST",
+        f"/v2/products/{product_id}/orders/leverage",
+        body=body,
+        authenticated=True,
     )
 
 
-def get_candles(
-    symbol,
-    resolution="5m",
-    limit=150,
-):
-    seconds = resolution_seconds(
-        resolution
-    )
+def get_delta_leverage(symbol):
+    product = find_product(symbol)
 
-    end = int(time.time())
+    if not product:
+        return None
 
-    start = (
-        end
-        - (
-            limit
-            * seconds
+    product_id = product.get("id")
+
+    if product_id is None:
+        return None
+
+    try:
+        data = delta_request(
+            "GET",
+            f"/v2/products/{product_id}/orders/leverage",
+            authenticated=True,
         )
-    )
 
+        result = data.get("result", {})
+
+        if isinstance(result, dict):
+            value = result.get("leverage")
+
+            if value is not None:
+                return float(value)
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
+# DELTA CANDLES
+# ============================================================
+
+def get_candles(symbol, resolution=RESOLUTION):
     data = delta_request(
         "GET",
         "/v2/history/candles",
         params={
             "symbol": symbol,
             "resolution": resolution,
-            "start": start,
-            "end": end,
+            "limit": CANDLE_LIMIT,
         },
         authenticated=False,
     )
 
-    candles = data.get(
-        "result",
-        [],
-    )
+    result = data.get("result", [])
 
-    if not isinstance(candles, list):
-        return []
+    candles = []
 
-    normalized = []
-
-    for candle in candles:
+    for item in result:
         try:
-            if isinstance(
-                candle,
-                dict,
-            ):
-                normalized.append(
-                    {
-                        "open": float(
-                            candle["open"]
-                        ),
-                        "high": float(
-                            candle["high"]
-                        ),
-                        "low": float(
-                            candle["low"]
-                        ),
-                        "close": float(
-                            candle["close"]
-                        ),
-                        "volume": float(
-                            candle.get(
-                                "volume",
-                                0,
-                            )
-                        ),
-                    }
-                )
+            if isinstance(item, dict):
+                ts = item.get("time")
+                open_price = item.get("open")
+                high = item.get("high")
+                low = item.get("low")
+                close = item.get("close")
+                volume = item.get("volume", 0)
+            else:
+                ts = item[0]
+                open_price = item[1]
+                high = item[2]
+                low = item[3]
+                close = item[4]
+                volume = item[5] if len(item) > 5 else 0
 
-            elif (
-                isinstance(
-                    candle,
-                    list,
-                )
-                and len(candle) >= 6
-            ):
-                normalized.append(
-                    {
-                        "open": float(
-                            candle[1]
-                        ),
-                        "high": float(
-                            candle[2]
-                        ),
-                        "low": float(
-                            candle[3]
-                        ),
-                        "close": float(
-                            candle[4]
-                        ),
-                        "volume": float(
-                            candle[5]
-                        ),
-                    }
-                )
+            candles.append(
+                {
+                    "time": float(ts),
+                    "open": float(open_price),
+                    "high": float(high),
+                    "low": float(low),
+                    "close": float(close),
+                    "volume": float(volume or 0),
+                }
+            )
 
         except Exception:
             continue
 
-    return normalized
+    candles.sort(key=lambda x: x["time"])
 
+    return candles
+
+
+# ============================================================
+# DELTA POSITION
+# ============================================================
+
+def get_positions():
+    data = delta_request(
+        "GET",
+        "/v2/positions",
+        authenticated=True,
+    )
+
+    return data.get("result", [])
+
+
+def get_position_for_symbol(symbol):
+    try:
+        positions = get_positions()
+
+        for position in positions:
+            psymbol = str(
+                position.get("product_symbol")
+                or position.get("symbol")
+                or ""
+            ).upper()
+
+            if psymbol == symbol.upper():
+                size = float(
+                    position.get("size", 0) or 0
+                )
+
+                if abs(size) > 0:
+                    return position
+
+    except Exception as exc:
+        event(
+            f"{symbol}: position check failed: {exc}"
+        )
+
+    return None
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
 
 def ema(values, period):
     if len(values) < period:
         return None
 
-    multiplier = 2 / (
-        period + 1
-    )
+    multiplier = 2 / (period + 1)
 
-    result = (
-        sum(values[:period])
-        / period
-    )
+    current = sum(values[:period]) / period
 
-    for value in values[period:]:
-        result = (
-            (
-                value
-                - result
-            )
-            * multiplier
-            + result
+    for price in values[period:]:
+        current = (
+            (price - current) * multiplier
+            + current
         )
 
-    return result
+    return current
 
 
 def rsi(values, period=14):
-    if len(values) <= period:
+    if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values),
-    ):
-        change = (
-            values[i]
-            - values[i - 1]
-        )
+    for i in range(1, period + 1):
+        change = values[i] - values[i - 1]
 
-        gains.append(
-            max(change, 0)
-        )
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
 
-        losses.append(
-            max(-change, 0)
-        )
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
-    avg_gain = (
-        sum(gains[:period])
-        / period
-    )
+    for i in range(period + 1, len(values)):
+        change = values[i] - values[i - 1]
 
-    avg_loss = (
-        sum(losses[:period])
-        / period
-    )
+        gain = max(change, 0)
+        loss = max(-change, 0)
 
-    for i in range(
-        period,
-        len(gains),
-    ):
         avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
-            + gains[i]
-        ) / period
+            ((avg_gain * (period - 1)) + gain)
+            / period
+        )
 
         avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
-            + losses[i]
-        ) / period
+            ((avg_loss * (period - 1)) + loss)
+            / period
+        )
 
     if avg_loss == 0:
         return 100.0
 
-    rs = (
-        avg_gain
-        / avg_loss
-    )
+    rs = avg_gain / avg_loss
 
-    return 100 - (
-        100
-        / (1 + rs)
-    )
+    return 100 - (100 / (1 + rs))
 
 
-def atr(
-    candles,
-    period=14,
-):
-    if len(candles) <= period:
+def atr(candles, period=14):
+    if len(candles) < period + 1:
         return None
 
     true_ranges = []
 
-    for i in range(
-        1,
-        len(candles),
-    ):
+    for i in range(1, len(candles)):
         current = candles[i]
         previous = candles[i - 1]
 
-        true_range = max(
-            current["high"]
-            - current["low"],
+        tr = max(
+            current["high"] - current["low"],
             abs(
                 current["high"]
                 - previous["close"]
@@ -843,33 +670,45 @@ def atr(
             ),
         )
 
-        true_ranges.append(
-            true_range
-        )
+        true_ranges.append(tr)
 
     if len(true_ranges) < period:
         return None
 
-    return (
-        sum(
-            true_ranges[-period:]
+    current_atr = (
+        sum(true_ranges[:period]) / period
+    )
+
+    for tr in true_ranges[period:]:
+        current_atr = (
+            (
+                current_atr * (period - 1)
+                + tr
+            )
+            / period
         )
-        / period
-    )
+
+    return current_atr
 
 
-def analyze_market(symbol):
-    candles = get_candles(
-        symbol,
-        state.get(
-            "timeframe",
-            "5m",
-        ),
-        150,
-    )
+# ============================================================
+# STRATEGY
+# ============================================================
 
-    if len(candles) < 30:
-        return None
+def calculate_signal(candles):
+    if len(candles) < 60:
+        return {
+            "side": "NO_TRADE",
+            "score": 0,
+            "price": candles[-1]["close"]
+            if candles
+            else None,
+            "reason": "Not enough candles",
+            "ema9": None,
+            "ema21": None,
+            "rsi": None,
+            "atr": None,
+        }
 
     closes = [
         x["close"]
@@ -881,1335 +720,1412 @@ def analyze_market(symbol):
         for x in candles
     ]
 
-    current = candles[-1]
-    previous = candles[-2]
+    price = closes[-1]
 
-    ema9 = ema(
-        closes,
-        9,
-    )
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    rsi_value = rsi(closes, 14)
+    atr_value = atr(candles, 14)
 
-    ema21 = ema(
-        closes,
-        21,
-    )
-
-    rsi14 = rsi(
-        closes,
-        14,
-    )
-
-    atr14 = atr(
-        candles,
-        14,
-    )
-
-    if any(
-        x is None
-        for x in [
-            ema9,
-            ema21,
-            rsi14,
-            atr14,
-        ]
+    if (
+        ema9 is None
+        or ema21 is None
+        or rsi_value is None
+        or atr_value is None
     ):
-        return None
-
-    recent_volume = volumes[-1]
-
-    volume_base = (
-        sum(
-            volumes[-21:-1]
-        ) / 20
-        if len(volumes) >= 21
-        else max(
-            sum(volumes)
-            / len(volumes),
-            1,
-        )
-    )
-
-    volume_ratio = (
-        recent_volume
-        / volume_base
-        if volume_base
-        else 1
-    )
-
-    recent_high = max(
-        x["high"]
-        for x in candles[-21:-1]
-    )
-
-    recent_low = min(
-        x["low"]
-        for x in candles[-21:-1]
-    )
+        return {
+            "side": "NO_TRADE",
+            "score": 0,
+            "price": price,
+            "reason": "Indicator calculation unavailable",
+        }
 
     long_score = 0
     short_score = 0
 
+    reasons_long = []
+    reasons_short = []
+
+    # --------------------------------------------------------
+    # EMA TREND
+    # --------------------------------------------------------
+
     if ema9 > ema21:
         long_score += 25
-
-    if ema9 < ema21:
+        reasons_long.append("EMA bullish")
+    elif ema9 < ema21:
         short_score += 25
+        reasons_short.append("EMA bearish")
 
-    if current["close"] > previous["close"]:
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    momentum_window = closes[-4:]
+
+    if momentum_window[-1] > momentum_window[0]:
         long_score += 10
-
-    if current["close"] < previous["close"]:
+        reasons_long.append("Momentum up")
+    elif momentum_window[-1] < momentum_window[0]:
         short_score += 10
+        reasons_short.append("Momentum down")
 
-    if rsi14 >= 52:
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if 52 <= rsi_value <= 68:
         long_score += 15
+        reasons_long.append("RSI supports long")
 
-    if rsi14 <= 48:
+    if 32 <= rsi_value <= 48:
         short_score += 15
+        reasons_short.append("RSI supports short")
 
-    if current["close"] > recent_high:
+    # Avoid chasing extreme RSI
+    if rsi_value > 75:
+        long_score -= 10
+
+    if rsi_value < 25:
+        short_score -= 10
+
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
+    previous_high = max(
+        x["high"]
+        for x in candles[-21:-1]
+    )
+
+    previous_low = min(
+        x["low"]
+        for x in candles[-21:-1]
+    )
+
+    if price > previous_high:
         long_score += 20
+        reasons_long.append("20-candle breakout")
 
-    if current["close"] < recent_low:
+    if price < previous_low:
         short_score += 20
+        reasons_short.append("20-candle breakdown")
 
-    if volume_ratio >= 1.2:
-        if current["close"] > previous["close"]:
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    recent_volume = (
+        sum(volumes[-5:]) / 5
+        if len(volumes) >= 5
+        else 0
+    )
+
+    base_volume = (
+        sum(volumes[-25:-5]) / 20
+        if len(volumes) >= 25
+        else 0
+    )
+
+    volume_ratio = (
+        recent_volume / base_volume
+        if base_volume > 0
+        else 0
+    )
+
+    if volume_ratio >= 1.15:
+        if long_score > short_score:
             long_score += 15
-
-        elif current["close"] < previous["close"]:
+            reasons_long.append("Volume confirmation")
+        elif short_score > long_score:
             short_score += 15
+            reasons_short.append("Volume confirmation")
+
+    # --------------------------------------------------------
+    # FINAL DECISION
+    # --------------------------------------------------------
 
     if (
         long_score >= 75
-        and long_score
-        > short_score + 10
+        and long_score >= short_score + 10
     ):
-        direction = "LONG"
-        score = long_score
+        side = "LONG"
+        score = min(long_score, 100)
+        reason = ", ".join(reasons_long)
 
     elif (
         short_score >= 75
-        and short_score
-        > long_score + 10
+        and short_score >= long_score + 10
     ):
-        direction = "SHORT"
-        score = short_score
+        side = "SHORT"
+        score = min(short_score, 100)
+        reason = ", ".join(reasons_short)
 
     else:
-        direction = "NO_TRADE"
+        side = "NO_TRADE"
         score = max(
-            long_score,
-            short_score,
+            min(long_score, 100),
+            min(short_score, 100),
         )
 
+        if long_score > short_score:
+            reason = (
+                f"Long setup incomplete "
+                f"({long_score}/75)"
+            )
+        elif short_score > long_score:
+            reason = (
+                f"Short setup incomplete "
+                f"({short_score}/75)"
+            )
+        else:
+            reason = "No directional edge"
+
     return {
-        "symbol": symbol,
-        "direction": direction,
+        "side": side,
         "score": score,
+        "price": price,
+        "reason": reason,
         "long_score": long_score,
         "short_score": short_score,
-        "price": current["close"],
         "ema9": ema9,
         "ema21": ema21,
-        "rsi": rsi14,
-        "atr": atr14,
+        "rsi": rsi_value,
+        "atr": atr_value,
         "volume_ratio": volume_ratio,
-        "time": utc_now(),
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
 
-def get_positions():
-    if not API_KEY or not API_SECRET:
-        return []
+# ============================================================
+# CMC
+# ============================================================
 
-    data = delta_request(
-        "GET",
-        "/v2/positions",
-        authenticated=True,
-    )
+def refresh_cmc_if_needed(force=False):
+    global cmc_cache
 
-    result = data.get(
-        "result",
-        [],
-    )
+    if not CMC_API_KEY:
+        return {
+            "connected": False,
+            "cached": False,
+            "data": {},
+            "error": "CMC_API_KEY not configured",
+        }
 
-    if isinstance(
-        result,
-        list,
+    now = time.time()
+
+    if (
+        not force
+        and cmc_cache["timestamp"]
+        and now - cmc_cache["timestamp"]
+        < CMC_CACHE_SECONDS
     ):
-        return result
+        return {
+            "connected": True,
+            "cached": True,
+            "data": cmc_cache["data"],
+            "error": cmc_cache["error"],
+        }
 
-    return []
-
-
-def get_open_position(
-    symbol=None,
-):
-    positions = get_positions()
-
-    for position in positions:
-        try:
-            size = float(
-                position.get(
-                    "size",
-                    0,
-                )
-                or 0
-            )
-        except Exception:
-            size = 0
-
-        if size == 0:
-            continue
-
-        if symbol:
-            if (
-                str(
-                    position.get(
-                        "symbol",
-                        "",
-                    )
-                ).upper()
-                != symbol.upper()
-            ):
-                continue
-
-        return position
-
-    return None
-
-
-def has_any_live_position():
     try:
-        return (
-            get_open_position()
-            is not None
+        response = requests.get(
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
+            params={
+                "symbol": ",".join(
+                    x.replace("USD", "")
+                    for x in SYMBOLS
+                ),
+                "convert": "USD",
+            },
+            headers={
+                "X-CMC_PRO_API_KEY": CMC_API_KEY,
+                "Accepts": "application/json",
+            },
+            timeout=10,
         )
+
+        response.raise_for_status()
+
+        payload = response.json()
+        data = payload.get("data", {})
+
+        cmc_cache = {
+            "timestamp": now,
+            "data": data,
+            "error": None,
+        }
+
+        return {
+            "connected": True,
+            "cached": False,
+            "data": data,
+            "error": None,
+        }
+
+    except Exception as exc:
+        cmc_cache["error"] = str(exc)
+
+        return {
+            "connected": False,
+            "cached": False,
+            "data": cmc_cache["data"],
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# PUBLIC IP
+# ============================================================
+
+def get_public_ip():
+    try:
+        response = requests.get(
+            "https://api.ipify.org?format=json",
+            timeout=5,
+        )
+
+        data = response.json()
+
+        runtime["public_ip"] = data.get("ip")
+
+        return runtime["public_ip"]
 
     except Exception:
-        return False
+        return None
 
 
-def set_leverage(
-    product_id,
-    leverage,
-):
-    return delta_request(
-        "POST",
-        f"/v2/products/{product_id}/orders/leverage",
-        body={
-            "leverage": str(
-                leverage
-            ),
-        },
-        authenticated=True,
-    )
+# ============================================================
+# QUANTITY / LEVERAGE VALIDATION
+# ============================================================
 
+def validate_coin_settings(symbol, quantity, leverage):
+    rules = product_rules(symbol)
 
-def place_market_order(
-    symbol,
-    side,
-    size,
-):
-    return delta_request(
-        "POST",
-        "/v2/orders",
-        body={
-            "product_symbol": symbol,
-            "order_type": "market_order",
-            "size": size,
-            "side": side,
-        },
-        authenticated=True,
-    )
+    if not rules.get("available"):
+        return False, rules.get(
+            "message",
+            "Delta product unavailable",
+        )
 
+    try:
+        quantity = float(quantity)
+        leverage = float(leverage)
+    except Exception:
+        return False, "Quantity and leverage must be numeric"
 
-def close_market_order(
-    symbol,
-    size,
-    position_side,
-):
-    side = (
-        "sell"
-        if position_side == "LONG"
-        else "buy"
-    )
+    if quantity <= 0:
+        return False, "Quantity must be greater than zero"
 
-    return place_market_order(
-        symbol,
-        side,
-        abs(size),
-    )
+    if leverage <= 0:
+        return False, "Leverage must be greater than zero"
 
+    min_qty = rules.get("min_quantity")
+    max_qty = rules.get("max_quantity")
+    step = rules.get("quantity_step")
 
-def selected_coin():
-    with state_lock:
-        for symbol in SYMBOLS:
-            coin = state["coins"].get(
-                symbol,
-                {},
+    if min_qty is not None and quantity < min_qty:
+        return False, (
+            f"Quantity below Delta minimum "
+            f"{min_qty}"
+        )
+
+    if max_qty is not None and quantity > max_qty:
+        return False, (
+            f"Quantity above Delta maximum "
+            f"{max_qty}"
+        )
+
+    if step is not None and step > 0:
+        quotient = quantity / step
+
+        if abs(
+            quotient - round(quotient)
+        ) > 1e-8:
+            return False, (
+                f"Quantity must follow Delta "
+                f"step {step}"
             )
 
-            if coin.get("enabled"):
-                return symbol
+    min_lev = rules.get("min_leverage")
+    max_lev = rules.get("max_leverage")
 
-    return None
-
-
-def paper_enter(signal):
-    symbol = signal["symbol"]
-
-    with state_lock:
-        config = state["coins"].get(
-            symbol,
-            {},
+    if min_lev is not None and leverage < min_lev:
+        return False, (
+            f"Leverage below Delta minimum "
+            f"{min_lev}x"
         )
 
-        quantity = config.get(
-            "quantity"
+    if max_lev is not None and leverage > max_lev:
+        return False, (
+            f"Leverage above Delta maximum "
+            f"{max_lev}x"
         )
 
-        leverage = config.get(
-            "leverage"
+    return True, "OK"
+
+
+# ============================================================
+# PAPER TRADING
+# ============================================================
+
+def paper_open(symbol, side, signal):
+    with lock:
+        if state["current_trade"] is not None:
+            return False
+
+        coin = state["coins"][symbol]
+
+        price = float(signal["price"])
+        atr_value = float(signal["atr"])
+
+        quantity = float(
+            coin["quantity"]
         )
 
-    if quantity is None or leverage is None:
-        add_event(
-            f"PAPER ENTRY BLOCKED {symbol}: "
-            "quantity/leverage not configured."
+        leverage = float(
+            coin["leverage"]
         )
-        return
 
-    with state_lock:
-        state["trade"] = {
+        if side == "LONG":
+            stop = price - (
+                atr_value * 1.5
+            )
+
+            target = price + (
+                atr_value * 3.0
+            )
+
+        else:
+            stop = price + (
+                atr_value * 1.5
+            )
+
+            target = price - (
+                atr_value * 3.0
+            )
+
+        state["current_trade"] = {
             "symbol": symbol,
-            "side": signal["direction"],
-            "entry": signal["price"],
-            "size": quantity,
+            "side": side,
+            "entry": price,
+            "quantity": quantity,
             "leverage": leverage,
-            "highest": signal["price"],
-            "lowest": signal["price"],
-            "initial_atr": signal["atr"],
-            "opened_at": utc_now(),
+            "stop": stop,
+            "target": target,
             "mode": "PAPER",
+            "opened_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "reason": signal["reason"],
         }
 
     save_state()
 
-    add_event(
-        f"PAPER ENTRY "
-        f"{signal['direction']} "
-        f"{symbol} @ "
-        f"{signal['price']}"
+    event(
+        f"PAPER {side} opened: "
+        f"{symbol} @ {price}"
     )
 
+    return True
 
-def paper_manage(signal):
-    with state_lock:
-        trade = deep_copy(
-            state.get("trade")
-        )
+
+def paper_manage():
+    with lock:
+        trade = state["current_trade"]
 
     if not trade:
         return
 
-    if (
-        trade["symbol"]
-        != signal["symbol"]
-    ):
-        return
+    symbol = trade["symbol"]
 
-    entry = float(
-        trade["entry"]
-    )
+    try:
+        candles = get_candles(symbol)
 
-    atr_value = float(
-        trade["initial_atr"]
-    )
-
-    price = float(
-        signal["price"]
-    )
-
-    if trade["side"] == "LONG":
-        trade["highest"] = max(
-            float(
-                trade.get(
-                    "highest",
-                    entry,
-                )
-            ),
-            price,
-        )
-
-        peak = float(
-            trade["highest"]
-        )
-
-        stop = max(
-            entry
-            - atr_value * 1.5,
-            peak
-            - atr_value * 1.8,
-        )
-
-        if price <= stop:
-            pnl = (
-                price
-                - entry
-            ) * trade["size"]
-
-            with state_lock:
-                state["trade"] = None
-
-            save_state()
-
-            add_event(
-                f"PAPER EXIT LONG "
-                f"{trade['symbol']} "
-                f"@ {price} "
-                f"PnL={pnl:.4f}"
-            )
-
+        if not candles:
             return
 
-        if (
-            signal["direction"]
-            == "SHORT"
-            and signal["score"] >= 85
-        ):
-            pnl = (
-                price
-                - entry
-            ) * trade["size"]
+        price = candles[-1]["close"]
 
-            with state_lock:
-                state["trade"] = None
+        side = trade["side"]
 
-            save_state()
+        exit_reason = None
 
-            add_event(
-                f"PAPER REVERSAL EXIT LONG "
-                f"{trade['symbol']} "
-                f"@ {price} "
-                f"PnL={pnl:.4f}"
+        if side == "LONG":
+
+            if price <= trade["stop"]:
+                exit_reason = "Stop loss"
+
+            elif price >= trade["target"]:
+                exit_reason = "Target reached"
+
+        elif side == "SHORT":
+
+            if price >= trade["stop"]:
+                exit_reason = "Stop loss"
+
+            elif price <= trade["target"]:
+                exit_reason = "Target reached"
+
+        if exit_reason:
+            close_trade(
+                price,
+                exit_reason,
             )
 
-            return
-
-    elif trade["side"] == "SHORT":
-        trade["lowest"] = min(
-            float(
-                trade.get(
-                    "lowest",
-                    entry,
-                )
-            ),
-            price,
+    except Exception as exc:
+        event(
+            f"Paper trade management error: {exc}"
         )
 
-        low = float(
-            trade["lowest"]
-        )
 
-        stop = min(
-            entry
-            + atr_value * 1.5,
-            low
-            + atr_value * 1.8,
-        )
+# ============================================================
+# LIVE ORDER
+# ============================================================
 
-        if price >= stop:
-            pnl = (
-                entry
-                - price
-            ) * trade["size"]
-
-            with state_lock:
-                state["trade"] = None
-
-            save_state()
-
-            add_event(
-                f"PAPER EXIT SHORT "
-                f"{trade['symbol']} "
-                f"@ {price} "
-                f"PnL={pnl:.4f}"
-            )
-
-            return
-
-        if (
-            signal["direction"]
-            == "LONG"
-            and signal["score"] >= 85
-        ):
-            pnl = (
-                entry
-                - price
-            ) * trade["size"]
-
-            with state_lock:
-                state["trade"] = None
-
-            save_state()
-
-            add_event(
-                f"PAPER REVERSAL EXIT SHORT "
-                f"{trade['symbol']} "
-                f"@ {price} "
-                f"PnL={pnl:.4f}"
-            )
-
-            return
-
-    with state_lock:
-        state["trade"] = trade
-
-    save_state()
-
-
-def live_enter(signal):
-    symbol = signal["symbol"]
-
-    if not API_KEY or not API_SECRET:
-        add_event(
-            "LIVE ENTRY BLOCKED: "
-            "API credentials missing."
-        )
-        return
-
-    with state_lock:
-        config = deep_copy(
-            state["coins"].get(
-                symbol,
-                {},
-            )
-        )
-
-    quantity = config.get(
-        "quantity"
-    )
-
-    leverage = config.get(
-        "leverage"
-    )
-
-    if (
-        quantity is None
-        or leverage is None
-    ):
-        add_event(
-            f"LIVE ENTRY BLOCKED {symbol}: "
-            "quantity/leverage not configured."
-        )
-        return
-
-    valid, message = (
-        validate_coin_settings(
-            symbol,
-            quantity,
-            leverage,
-        )
+def place_live_market_order(
+    symbol,
+    side,
+    quantity,
+    leverage,
+):
+    valid, message = validate_coin_settings(
+        symbol,
+        quantity,
+        leverage,
     )
 
     if not valid:
-        add_event(
-            f"LIVE ENTRY BLOCKED: "
-            f"{message}"
-        )
-        return
+        raise RuntimeError(message)
 
-    product = find_product(
+    set_delta_leverage(
+        symbol,
+        leverage,
+    )
+
+    product = find_product(symbol)
+
+    if not product:
+        raise RuntimeError(
+            f"{symbol}: product unavailable"
+        )
+
+    body = {
+        "product_symbol": symbol,
+        "size": quantity,
+        "side": (
+            "buy"
+            if side == "LONG"
+            else "sell"
+        ),
+        "order_type": "market_order",
+    }
+
+    return delta_request(
+        "POST",
+        "/v2/orders",
+        body=body,
+        authenticated=True,
+    )
+
+
+def live_open(symbol, side, signal):
+    with lock:
+        if state["current_trade"] is not None:
+            return False
+
+        coin = state["coins"][symbol]
+
+        quantity = float(
+            coin["quantity"]
+        )
+
+        leverage = float(
+            coin["leverage"]
+        )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Existing exchange position check prevents accidental
+    # second position.
+    # --------------------------------------------------------
+
+    existing = get_position_for_symbol(
         symbol
     )
 
-    if not product:
-        add_event(
-            f"LIVE ENTRY BLOCKED: "
-            f"Delta product not found "
-            f"{symbol}"
+    if existing:
+        event(
+            f"LIVE entry blocked: existing "
+            f"{symbol} position detected"
         )
-        return
 
-    product_id = product.get(
-        "id"
+        return False
+
+    result = place_live_market_order(
+        symbol,
+        side,
+        quantity,
+        leverage,
     )
 
-    if product_id is None:
-        add_event(
-            f"LIVE ENTRY BLOCKED: "
-            f"{symbol} product ID missing."
-        )
-        return
+    price = float(signal["price"])
 
-    try:
-        set_leverage(
-            product_id,
-            leverage,
-        )
-
-        side = (
-            "buy"
-            if signal["direction"]
-            == "LONG"
-            else "sell"
-        )
-
-        result = place_market_order(
-            symbol,
-            side,
-            quantity,
-        )
-
-        order = result.get(
-            "result",
-            result,
-        )
-
-        with state_lock:
-            state["trade"] = {
-                "symbol": symbol,
-                "side": signal["direction"],
-                "entry": signal["price"],
-                "size": quantity,
-                "leverage": leverage,
-                "highest": signal["price"],
-                "lowest": signal["price"],
-                "initial_atr": signal["atr"],
-                "opened_at": utc_now(),
-                "mode": "LIVE",
-                "order": order,
-                "protective_stop": None,
-            }
-
-        save_state()
-
-        add_event(
-            f"LIVE ENTRY "
-            f"{signal['direction']} "
-            f"{symbol} @ "
-            f"{signal['price']}"
-        )
-
-        add_event(
-            "LIVE protective bracket is "
-            "not yet implemented."
-        )
-
-    except Exception as exc:
-        add_event(
-            f"LIVE ENTRY ERROR "
-            f"{symbol}: {exc}"
-        )
-
-
-def live_manage(signal):
-    with state_lock:
-        trade = deep_copy(
-            state.get("trade")
-        )
-
-    if not trade:
-        return
-
-    position = get_open_position(
-        trade["symbol"]
-    )
-
-    if not position:
-        with state_lock:
-            state["trade"] = None
-
-        save_state()
-
-        add_event(
-            f"Position closed externally: "
-            f"{trade['symbol']}"
-        )
-
-        return
-
-    size = float(
-        position.get(
-            "size",
-            0,
-        )
-        or 0
-    )
-
-    entry = float(
-        position.get(
-            "entry_price",
-            position.get(
-                "entryPrice",
-                trade["entry"],
-            ),
-        )
-        or trade["entry"]
-    )
-
-    price = float(
-        signal["price"]
-    )
-
-    trade["entry"] = entry
-
-    if trade["side"] == "LONG":
-        trade["highest"] = max(
-            float(
-                trade.get(
-                    "highest",
-                    entry,
-                )
-            ),
-            price,
-        )
-
-        if (
-            signal["direction"]
-            == "SHORT"
-            and signal["score"] >= 85
-        ):
-            try:
-                close_market_order(
-                    trade["symbol"],
-                    size,
-                    "LONG",
-                )
-
-                with state_lock:
-                    state["trade"] = None
-
-                save_state()
-
-                add_event(
-                    f"LIVE EXIT LONG "
-                    f"{trade['symbol']} "
-                    f"@ {price}"
-                )
-
-            except Exception as exc:
-                add_event(
-                    f"LIVE EXIT ERROR: "
-                    f"{exc}"
-                )
-
-    elif trade["side"] == "SHORT":
-        trade["lowest"] = min(
-            float(
-                trade.get(
-                    "lowest",
-                    entry,
-                )
-            ),
-            price,
-        )
-
-        if (
-            signal["direction"]
-            == "LONG"
-            and signal["score"] >= 85
-        ):
-            try:
-                close_market_order(
-                    trade["symbol"],
-                    size,
-                    "SHORT",
-                )
-
-                with state_lock:
-                    state["trade"] = None
-
-                save_state()
-
-                add_event(
-                    f"LIVE EXIT SHORT "
-                    f"{trade['symbol']} "
-                    f"@ {price}"
-                )
-
-            except Exception as exc:
-                add_event(
-                    f"LIVE EXIT ERROR: "
-                    f"{exc}"
-                )
-
-    with state_lock:
-        state["trade"] = trade
+    with lock:
+        state["current_trade"] = {
+            "symbol": symbol,
+            "side": side,
+            "entry": price,
+            "quantity": quantity,
+            "leverage": leverage,
+            "stop": None,
+            "target": None,
+            "mode": "LIVE",
+            "exchange_order": result,
+            "opened_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "reason": signal["reason"],
+            "protective_order": False,
+        }
 
     save_state()
 
+    event(
+        f"LIVE {side} opened: "
+        f"{symbol} @ {price}"
+    )
+
+    event(
+        "WARNING: exchange-side protective "
+        "bracket must be configured before "
+        "production LIVE deployment."
+    )
+
+    return True
+
+
+# ============================================================
+# CLOSE TRADE
+# ============================================================
+
+def close_live_trade(price, reason):
+    with lock:
+        trade = state["current_trade"]
+
+    if not trade:
+        return False
+
+    symbol = trade["symbol"]
+
+    position = get_position_for_symbol(
+        symbol
+    )
+
+    if not position:
+        with lock:
+            state["current_trade"] = None
+
+        save_state()
+
+        event(
+            f"LIVE position already closed: "
+            f"{symbol}"
+        )
+
+        return True
+
+    size = float(
+        position.get("size", 0)
+    )
+
+    if size == 0:
+        return False
+
+    side = str(
+        position.get("side", "")
+    ).lower()
+
+    close_side = (
+        "sell"
+        if side == "buy"
+        else "buy"
+    )
+
+    body = {
+        "product_symbol": symbol,
+        "size": abs(size),
+        "side": close_side,
+        "order_type": "market_order",
+        "reduce_only": True,
+    }
+
+    delta_request(
+        "POST",
+        "/v2/orders",
+        body=body,
+        authenticated=True,
+    )
+
+    with lock:
+        state["current_trade"] = None
+
+    save_state()
+
+    event(
+        f"LIVE position closed: "
+        f"{symbol} @ {price} "
+        f"({reason})"
+    )
+
+    return True
+
+
+def close_trade(price, reason):
+    with lock:
+        trade = state["current_trade"]
+
+    if not trade:
+        return False
+
+    if trade["mode"] == "LIVE":
+        return close_live_trade(
+            price,
+            reason,
+        )
+
+    with lock:
+        state["current_trade"] = None
+
+    save_state()
+
+    event(
+        f"PAPER trade closed: "
+        f"{trade['symbol']} @ {price} "
+        f"({reason})"
+    )
+
+    return True
+
+
+# ============================================================
+# SIGNAL SCANNER
+# ============================================================
+
+def scan_all_coins():
+    results = {}
+
+    for symbol in SYMBOLS:
+        try:
+            candles = get_candles(symbol)
+
+            signal = calculate_signal(
+                candles
+            )
+
+            with lock:
+                state["coins"][symbol][
+                    "last_signal"
+                ] = signal
+
+            results[symbol] = signal
+
+        except Exception as exc:
+            signal = {
+                "side": "NO_TRADE",
+                "score": 0,
+                "price": None,
+                "reason": f"Data error: {exc}",
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+
+            with lock:
+                state["coins"][symbol][
+                    "last_signal"
+                ] = signal
+
+            results[symbol] = signal
+
+    save_state()
+
+    return results
+
+
+# ============================================================
+# STRONGEST SIGNAL
+# ============================================================
+
+def strongest_signal():
+    candidates = []
+
+    with lock:
+        for symbol in SYMBOLS:
+            signal = state["coins"][symbol][
+                "last_signal"
+            ]
+
+            if signal.get("side") in (
+                "LONG",
+                "SHORT",
+            ):
+                candidates.append(
+                    (
+                        symbol,
+                        signal,
+                    )
+                )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: item[1].get(
+            "score",
+            0,
+        ),
+        reverse=True,
+    )
+
+    symbol, signal = candidates[0]
+
+    return {
+        "symbol": symbol,
+        **signal,
+    }
+
+
+# ============================================================
+# TRADING ENGINE
+# ============================================================
 
 def trading_cycle():
-    while True:
-        try:
-            with state_lock:
-                enabled = bool(
-                    state.get(
-                        "enabled"
-                    )
-                )
+    runtime["last_scan"] = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-                mode = state.get(
-                    "mode",
-                    "PAPER",
-                )
+    runtime["last_scan_error"] = None
 
-                trade = deep_copy(
-                    state.get("trade")
-                )
+    try:
+        # ----------------------------------------------------
+        # Always analyze all five coins.
+        # ----------------------------------------------------
 
-            if not enabled:
-                time.sleep(
-                    SCAN_INTERVAL
-                )
-                continue
+        signals = scan_all_coins()
 
-            if mode == "LIVE":
-                try:
-                    exchange_position = (
-                        get_open_position()
-                    )
+        # ----------------------------------------------------
+        # Manage existing trade first.
+        # ----------------------------------------------------
 
-                    if (
-                        exchange_position
-                        is None
-                        and trade
-                    ):
-                        with state_lock:
-                            state["trade"] = None
+        with lock:
+            trade = state["current_trade"]
 
-                        save_state()
+        if trade:
+            if trade["mode"] == "PAPER":
+                paper_manage()
 
-                        add_event(
-                            "Reconciliation: "
-                            "exchange position absent; "
-                            "local trade cleared."
-                        )
-
-                    elif (
-                        exchange_position
-                        and not trade
-                    ):
-                        add_event(
-                            "SAFETY BLOCK: exchange "
-                            "position exists without "
-                            "local trade state."
-                        )
-
-                        time.sleep(
-                            SCAN_INTERVAL
-                        )
-                        continue
-
-                except Exception as exc:
-                    add_event(
-                        f"Reconciliation error: "
-                        f"{exc}"
-                    )
-
-                    time.sleep(
-                        SCAN_INTERVAL
-                    )
-                    continue
-
-            if trade:
-                signal = analyze_market(
+            elif trade["mode"] == "LIVE":
+                # No automatic LIVE exit without
+                # exchange-side protection.
+                #
+                # If exchange says position is gone,
+                # reconcile local state.
+                position = get_position_for_symbol(
                     trade["symbol"]
                 )
 
-                if signal:
-                    with state_lock:
-                        state["last_signal"] = signal
-
-                        if (
-                            signal["symbol"]
-                            in state["coins"]
-                        ):
-                            state["coins"][
-                                signal["symbol"]
-                            ]["last_signal"] = (
-                                signal
-                            )
+                if not position:
+                    with lock:
+                        state["current_trade"] = None
 
                     save_state()
 
-                    if mode == "PAPER":
-                        paper_manage(
-                            signal
-                        )
-
-                    elif mode == "LIVE":
-                        live_manage(
-                            signal
-                        )
-
-                time.sleep(
-                    SCAN_INTERVAL
-                )
-
-                continue
-
-            selected = selected_coin()
-
-            if not selected:
-                time.sleep(
-                    SCAN_INTERVAL
-                )
-                continue
-
-            if mode == "LIVE":
-                try:
-                    if has_any_live_position():
-                        add_event(
-                            "ENTRY BLOCKED: "
-                            "exchange position already exists."
-                        )
-
-                        time.sleep(
-                            SCAN_INTERVAL
-                        )
-                        continue
-
-                except Exception as exc:
-                    add_event(
-                        f"Position check failed: "
-                        f"{exc}"
+                    event(
+                        f"Reconciled closed LIVE "
+                        f"position: {trade['symbol']}"
                     )
 
-                    time.sleep(
-                        SCAN_INTERVAL
-                    )
-                    continue
+            return
 
-            signal = analyze_market(
-                selected
+        # ----------------------------------------------------
+        # System OFF = absolutely no bot entry.
+        # ----------------------------------------------------
+
+        with lock:
+            system_on = bool(
+                state["system_on"]
             )
 
-            if signal:
-                with state_lock:
-                    state["last_signal"] = signal
-
-                    state["coins"][
-                        selected
-                    ]["last_signal"] = (
-                        signal
-                    )
-
-                save_state()
-
-                if (
-                    signal["direction"]
-                    != "NO_TRADE"
-                ):
-                    if mode == "PAPER":
-                        paper_enter(
-                            signal
-                        )
-
-                    elif mode == "LIVE":
-                        live_enter(
-                            signal
-                        )
-
-            time.sleep(
-                SCAN_INTERVAL
+            selected = (
+                state["selected_coin"]
             )
 
-        except Exception as exc:
-            add_event(
-                f"ENGINE ERROR: {exc}"
+        if not system_on:
+            return
+
+        # ----------------------------------------------------
+        # No selected coin = no trade.
+        # ----------------------------------------------------
+
+        if selected not in SYMBOLS:
+            return
+
+        signal = signals.get(
+            selected
+        )
+
+        if not signal:
+            return
+
+        if signal.get("side") not in (
+            "LONG",
+            "SHORT",
+        ):
+            return
+
+        # ----------------------------------------------------
+        # Only the ON coin can trade.
+        # ----------------------------------------------------
+
+        with lock:
+            coin_enabled = bool(
+                state["coins"][selected][
+                    "enabled"
+                ]
             )
 
-            time.sleep(
-                SCAN_INTERVAL
+            mode = state["mode"]
+
+            quantity = float(
+                state["coins"][selected][
+                    "quantity"
+                ]
             )
+
+            leverage = float(
+                state["coins"][selected][
+                    "leverage"
+                ]
+            )
+
+        if not coin_enabled:
+            return
+
+        valid, message = validate_coin_settings(
+            selected,
+            quantity,
+            leverage,
+        )
+
+        if not valid:
+            event(
+                f"{selected}: entry blocked - "
+                f"{message}"
+            )
+            return
+
+        # ----------------------------------------------------
+        # Execute.
+        # ----------------------------------------------------
+
+        if mode == "PAPER":
+            paper_open(
+                selected,
+                signal["side"],
+                signal,
+            )
+
+        elif mode == "LIVE":
+            live_open(
+                selected,
+                signal["side"],
+                signal,
+            )
+
+    except Exception as exc:
+        runtime["last_scan_error"] = str(exc)
+
+        event(
+            f"Trading engine error: {exc}"
+        )
+
+
+def engine_loop():
+    event("Trading engine thread started")
+
+    while not engine_stop.is_set():
+        started = time.time()
+
+        trading_cycle()
+
+        elapsed = time.time() - started
+
+        wait_time = max(
+            0.5,
+            SCAN_SECONDS - elapsed,
+        )
+
+        engine_stop.wait(wait_time)
+
+    event("Trading engine thread stopped")
 
 
 def start_engine():
     global engine_thread
 
-    if (
-        engine_thread
-        and engine_thread.is_alive()
-    ):
-        return
+    with lock:
+        if state["system_on"] is False:
+            return False, (
+                "System is OFF"
+            )
+
+        if state["selected_coin"] not in SYMBOLS:
+            return False, (
+                "Select one coin before starting"
+            )
+
+        selected = state[
+            "selected_coin"
+        ]
+
+        if not state["coins"][selected][
+            "enabled"
+        ]:
+            return False, (
+                f"{selected} is OFF"
+            )
+
+    if engine_thread and engine_thread.is_alive():
+        return True, "Already running"
+
+    engine_stop.clear()
+
+    runtime["started_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     engine_thread = threading.Thread(
-        target=trading_cycle,
+        target=engine_loop,
         daemon=True,
+        name="PrimeMinisterTradingEngine",
     )
 
     engine_thread.start()
 
-
-@app.route("/")
-def index():
-    return render_template_string(
-        HTML,
-    )
+    return True, "Engine started"
 
 
-@app.route("/api/status")
-def api_status():
-    with state_lock:
-        snapshot = deep_copy(
-            state
-        )
+def stop_engine():
+    engine_stop.set()
 
-    return jsonify(
-        snapshot
-    )
+    return True, "Engine stopping"
 
 
-@app.route("/api/products")
-def api_products():
+# ============================================================
+# STARTUP RECONCILIATION
+# ============================================================
+
+def reconcile_live_state():
+    if not API_KEY or not API_SECRET:
+        return
+
     try:
-        force = (
-            request.args.get(
-                "refresh",
-                "0",
+        positions = get_positions()
+
+        live_positions = []
+
+        for position in positions:
+            try:
+                size = float(
+                    position.get("size", 0)
+                    or 0
+                )
+            except Exception:
+                size = 0
+
+            if abs(size) <= 0:
+                continue
+
+            live_positions.append(
+                position
             )
-            == "1"
-        )
 
-        rules = get_all_coin_rules(
-            force=force
-        )
+        with lock:
+            local_trade = state[
+                "current_trade"
+            ]
 
-        return jsonify(
-            {
-                "ok": True,
-                "rules": rules,
-            }
-        )
+        if local_trade:
+            symbol = local_trade.get(
+                "symbol"
+            )
+
+            found = any(
+                str(
+                    p.get("product_symbol")
+                    or p.get("symbol")
+                    or ""
+                ).upper()
+                == str(symbol).upper()
+                for p in live_positions
+            )
+
+            if not found:
+                with lock:
+                    state[
+                        "current_trade"
+                    ] = None
+
+                save_state()
+
+                event(
+                    f"Startup reconciliation: "
+                    f"{symbol} position not found"
+                )
+
+        elif len(live_positions) == 1:
+            # Do not invent entry information.
+            # Block autonomous trading until user
+            # explicitly reconciles this position.
+            position = live_positions[0]
+
+            symbol = (
+                position.get(
+                    "product_symbol"
+                )
+                or position.get("symbol")
+            )
+
+            with lock:
+                state[
+                    "current_trade"
+                ] = {
+                    "symbol": symbol,
+                    "side": str(
+                        position.get(
+                            "side",
+                            "unknown",
+                        )
+                    ).upper(),
+                    "entry": position.get(
+                        "entry_price"
+                    ),
+                    "quantity": abs(
+                        float(
+                            position.get(
+                                "size",
+                                0,
+                            )
+                            or 0
+                        )
+                    ),
+                    "leverage": position.get(
+                        "leverage"
+                    ),
+                    "mode": "LIVE",
+                    "opened_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "reconciled": True,
+                    "protective_order": False,
+                }
+
+            save_state()
+
+            event(
+                f"Startup found unmanaged LIVE "
+                f"position on {symbol}; "
+                f"new bot entries blocked"
+            )
+
+        elif len(live_positions) > 1:
+            event(
+                "CRITICAL: multiple LIVE positions "
+                "detected. Autonomous entries blocked."
+            )
 
     except Exception as exc:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        ), 500
+        event(
+            f"Startup reconciliation failed: {exc}"
+        )
 
 
-@app.route(
-    "/api/coin/<symbol>",
-    methods=["GET"],
-)
-def api_coin(symbol):
+# ============================================================
+# API — DASHBOARD STATE
+# ============================================================
+
+@app.get("/api/state")
+def api_state():
+    with lock:
+        snapshot = json.loads(
+            json.dumps(state)
+        )
+
+    cmc = refresh_cmc_if_needed(
+        force=False
+    )
+
+    snapshot["runtime"] = runtime
+    snapshot["strongest_signal"] = (
+        strongest_signal()
+    )
+
+    snapshot["cmc"] = {
+        "connected": cmc["connected"],
+        "cached": cmc["cached"],
+        "error": cmc["error"],
+        "timestamp": cmc_cache["timestamp"],
+    }
+
+    snapshot["engine_running"] = bool(
+        engine_thread
+        and engine_thread.is_alive()
+    )
+
+    return jsonify(snapshot)
+
+
+# ============================================================
+# API — PRODUCT RULES
+# ============================================================
+
+@app.get("/api/coin/<symbol>/rules")
+def api_coin_rules(symbol):
     symbol = symbol.upper()
 
     if symbol not in SYMBOLS:
         return jsonify(
             {
-                "ok": False,
-                "error": "Unsupported coin.",
-            }
-        ), 404
-
-    try:
-        product = find_product(
-            symbol
-        )
-
-        rules = normalise_product_rules(
-            product
-        )
-
-        with state_lock:
-            config = deep_copy(
-                state["coins"][
-                    symbol
-                ]
-            )
-
-        return jsonify(
-            {
-                "ok": True,
-                "symbol": symbol,
-                "rules": rules,
-                "config": config,
-            }
-        )
-
-    except Exception as exc:
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        ), 500
-
-
-@app.route(
-    "/api/coin/<symbol>",
-    methods=["POST"],
-)
-def api_coin_config(symbol):
-    symbol = symbol.upper()
-
-    if symbol not in SYMBOLS:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "Unsupported coin.",
-            }
-        ), 404
-
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
-
-    enabled = bool(
-        data.get(
-            "enabled",
-            False,
-        )
-    )
-
-    quantity_raw = data.get(
-        "quantity"
-    )
-
-    leverage_raw = data.get(
-        "leverage"
-    )
-
-    if (
-        quantity_raw in (
-            None,
-            "",
-        )
-        or leverage_raw in (
-            None,
-            "",
-        )
-    ):
-        return jsonify(
-            {
-                "ok": False,
-                "error": (
-                    "Quantity and leverage "
-                    "are required."
-                ),
+                "success": False,
+                "error": "Unsupported coin",
             }
         ), 400
 
+    rules = product_rules(symbol)
+
+    return jsonify(
+        {
+            "success": True,
+            "rules": rules,
+        }
+    )
+
+
+# ============================================================
+# API — COIN SETTINGS
+# ============================================================
+
+@app.post("/api/coin/<symbol>/settings")
+def api_coin_settings(symbol):
+    symbol = symbol.upper()
+
+    if symbol not in SYMBOLS:
+        return jsonify(
+            {
+                "success": False,
+                "error": "Unsupported coin",
+            }
+        ), 400
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
     try:
         quantity = float(
-            quantity_raw
+            data.get("quantity")
         )
 
         leverage = float(
-            leverage_raw
+            data.get("leverage")
         )
 
     except Exception:
         return jsonify(
             {
-                "ok": False,
+                "success": False,
                 "error": (
                     "Quantity and leverage "
-                    "must be numeric."
+                    "are required"
                 ),
             }
         ), 400
 
-    valid, message = (
-        validate_coin_settings(
-            symbol,
-            quantity,
-            leverage,
-        )
+    valid, message = validate_coin_settings(
+        symbol,
+        quantity,
+        leverage,
     )
 
     if not valid:
         return jsonify(
             {
-                "ok": False,
+                "success": False,
                 "error": message,
             }
         ), 400
 
-    with state_lock:
-        if enabled:
-            # Only ONE coin can be selected/ON.
-            for other_symbol in SYMBOLS:
-                state["coins"][
-                    other_symbol
-                ]["enabled"] = (
-                    other_symbol
-                    == symbol
-                )
+    with lock:
+        state["coins"][symbol][
+            "quantity"
+        ] = quantity
 
-        else:
-            state["coins"][
-                symbol
-            ]["enabled"] = False
+        state["coins"][symbol][
+            "leverage"
+        ] = leverage
 
-        state["coins"][
-            symbol
-        ]["quantity"] = quantity
-
-        state["coins"][
-            symbol
-        ]["leverage"] = leverage
-
-        product = find_product(
-            symbol
-        )
-
-        state["coins"][
-            symbol
-        ]["rules"] = (
-            normalise_product_rules(
-                product
-            )
-        )
+        state["coins"][symbol][
+            "rules"
+        ] = product_rules(symbol)
 
     save_state()
 
-    add_event(
-        f"{symbol} settings saved: "
-        f"quantity={quantity}, "
-        f"leverage={leverage}, "
-        f"ON={enabled}"
+    event(
+        f"{symbol} settings updated: "
+        f"qty={quantity}, lev={leverage}x"
     )
 
     return jsonify(
         {
-            "ok": True,
+            "success": True,
             "symbol": symbol,
-            "config": state[
-                "coins"
-            ][symbol],
+            "quantity": quantity,
+            "leverage": leverage,
         }
     )
 
 
-@app.route(
-    "/api/coin/<symbol>/toggle",
-    methods=["POST"],
-)
+# ============================================================
+# API — COIN ON/OFF
+# ============================================================
+
+@app.post("/api/coin/<symbol>/toggle")
 def api_coin_toggle(symbol):
     symbol = symbol.upper()
 
     if symbol not in SYMBOLS:
         return jsonify(
             {
-                "ok": False,
-                "error": "Unsupported coin.",
+                "success": False,
+                "error": "Unsupported coin",
             }
-        ), 404
+        ), 400
 
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
+    data = request.get_json(
+        silent=True
+    ) or {}
 
     enabled = bool(
-        data.get(
-            "enabled",
-            False,
-        )
+        data.get("enabled")
     )
 
-    with state_lock:
-        coin = state["coins"][
-            symbol
-        ]
-
+    with lock:
         if enabled:
-            if (
-                coin.get(
-                    "quantity"
+            # Exactly one coin ON.
+            for other in SYMBOLS:
+                state["coins"][other][
+                    "enabled"
+                ] = (
+                    other == symbol
                 )
-                is None
-                or coin.get(
-                    "leverage"
-                )
-                is None
-            ):
-                return jsonify(
-                    {
-                        "ok": False,
-                        "error": (
-                            "Set quantity and "
-                            "leverage first."
-                        ),
-                    }
-                ), 400
 
-            valid, message = (
-                validate_coin_settings(
-                    symbol,
-                    coin["quantity"],
-                    coin["leverage"],
-                )
-            )
-
-            if not valid:
-                return jsonify(
-                    {
-                        "ok": False,
-                        "error": message,
-                    }
-                ), 400
-
-            for other_symbol in SYMBOLS:
-                state["coins"][
-                    other_symbol
-                ]["enabled"] = (
-                    other_symbol
-                    == symbol
-                )
+            state["selected_coin"] = symbol
 
         else:
-            coin["enabled"] = False
+            state["coins"][symbol][
+                "enabled"
+            ] = False
+
+            if (
+                state["selected_coin"]
+                == symbol
+            ):
+                state["selected_coin"] = None
 
     save_state()
 
-    add_event(
-        f"{symbol} "
+    event(
+        f"{symbol} turned "
         f"{'ON' if enabled else 'OFF'}"
     )
 
     return jsonify(
         {
-            "ok": True,
-            "selected": selected_coin(),
+            "success": True,
+            "selected_coin": state[
+                "selected_coin"
+            ],
         }
     )
 
 
-@app.route(
-    "/api/config",
-    methods=["POST"],
-)
-def api_config():
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
+# ============================================================
+# API — SYSTEM
+# ============================================================
+
+@app.post("/api/system")
+def api_system():
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    enabled = bool(
+        data.get("enabled")
     )
 
-    mode = str(
-        data.get(
-            "mode",
-            state.get(
-                "mode",
-                "PAPER",
-            ),
+    with lock:
+        state["system_on"] = enabled
+
+    if enabled:
+        ok, message = start_engine()
+
+        if not ok:
+            with lock:
+                state["system_on"] = False
+
+            save_state()
+
+            return jsonify(
+                {
+                    "success": False,
+                    "error": message,
+                }
+            ), 400
+
+        event("SYSTEM ON")
+
+    else:
+        stop_engine()
+
+        event(
+            "SYSTEM OFF — no new "
+            "bot-initiated trades"
         )
+
+    save_state()
+
+    return jsonify(
+        {
+            "success": True,
+            "system_on": enabled,
+        }
+    )
+
+
+# ============================================================
+# API — MODE
+# ============================================================
+
+@app.post("/api/mode")
+def api_mode():
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    mode = str(
+        data.get("mode", "")
     ).upper()
 
     if mode not in (
@@ -2218,216 +2134,146 @@ def api_config():
     ):
         return jsonify(
             {
-                "ok": False,
-                "error": "Invalid mode.",
+                "success": False,
+                "error": "Mode must be PAPER or LIVE",
             }
         ), 400
 
-    with state_lock:
+    with lock:
+        if state["current_trade"] is not None:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": (
+                        "Cannot change mode "
+                        "while a trade is open"
+                    ),
+                }
+            ), 400
+
         state["mode"] = mode
 
     save_state()
 
-    add_event(
+    event(
         f"Mode changed to {mode}"
     )
 
     return jsonify(
         {
-            "ok": True,
+            "success": True,
             "mode": mode,
         }
     )
 
 
-@app.route(
-    "/api/start",
-    methods=["POST"],
-)
-def api_start():
-    with state_lock:
-        selected = selected_coin()
+# ============================================================
+# API — MANUAL CLOSE
+# ============================================================
 
-        if not selected:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": (
-                        "Select one coin and "
-                        "configure its quantity "
-                        "and leverage first."
-                    ),
-                }
-            ), 400
-
-        state["enabled"] = True
-
-    save_state()
-
-    add_event(
-        f"SYSTEM ON: automatic trading enabled "
-        f"for {selected}."
-    )
-
-    return jsonify(
-        {
-            "ok": True,
-            "enabled": True,
-            "selected": selected,
-        }
-    )
-
-
-@app.route(
-    "/api/stop",
-    methods=["POST"],
-)
-def api_stop():
-    with state_lock:
-        state["enabled"] = False
-
-    save_state()
-
-    add_event(
-        "SYSTEM OFF: bot automatic trading "
-        "actions disabled."
-    )
-
-    return jsonify(
-        {
-            "ok": True,
-            "enabled": False,
-        }
-    )
-
-
-@app.route(
-    "/api/close",
-    methods=["POST"],
-)
-def api_close():
-    with state_lock:
-        trade = deep_copy(
-            state.get("trade")
-        )
-
-        mode = state.get(
-            "mode",
-            "PAPER",
-        )
+@app.post("/api/trade/close")
+def api_close_trade():
+    with lock:
+        trade = state["current_trade"]
 
     if not trade:
         return jsonify(
             {
-                "ok": False,
-                "error": (
-                    "No bot trade recorded."
-                ),
+                "success": False,
+                "error": "No open trade",
             }
         ), 400
 
+    symbol = trade["symbol"]
+
     try:
-        if mode == "PAPER":
-            with state_lock:
-                state["trade"] = None
+        candles = get_candles(symbol)
 
-            save_state()
-
-            add_event(
-                f"Manual PAPER close: "
-                f"{trade['symbol']}"
-            )
-
-            return jsonify(
-                {
-                    "ok": True
-                }
-            )
-
-        position = get_open_position(
-            trade["symbol"]
+        price = (
+            candles[-1]["close"]
+            if candles
+            else trade.get("entry")
         )
 
-        if not position:
-            with state_lock:
-                state["trade"] = None
-
-            save_state()
-
-            return jsonify(
-                {
-                    "ok": True
-                }
-            )
-
-        size = float(
-            position.get(
-                "size",
-                0,
-            )
-            or 0
-        )
-
-        position_side = (
-            "LONG"
-            if size > 0
-            else "SHORT"
-        )
-
-        close_market_order(
-            trade["symbol"],
-            size,
-            position_side,
-        )
-
-        with state_lock:
-            state["trade"] = None
-
-        save_state()
-
-        add_event(
-            f"Manual LIVE close: "
-            f"{trade['symbol']}"
+        close_trade(
+            price,
+            "Manual close",
         )
 
         return jsonify(
             {
-                "ok": True
+                "success": True,
             }
         )
 
     except Exception as exc:
         return jsonify(
             {
-                "ok": False,
+                "success": False,
                 "error": str(exc),
             }
         ), 500
 
 
-@app.route("/api/ip")
-def api_ip():
-    ip = public_ip()
+# ============================================================
+# API — CMC STATUS
+# ============================================================
 
-    with state_lock:
-        state["last_ip"] = ip
-
-    save_state()
+@app.get("/api/cmc")
+def api_cmc():
+    data = refresh_cmc_if_needed(
+        force=False
+    )
 
     return jsonify(
         {
-            "ip": ip
+            "success": True,
+            "connected": data["connected"],
+            "cached": data["cached"],
+            "error": data["error"],
+            "timestamp": cmc_cache[
+                "timestamp"
+            ],
+            "data": data["data"],
         }
     )
 
+
+# ============================================================
+# API — PUBLIC IP
+# ============================================================
+
+@app.get("/api/ip")
+def api_ip():
+    ip = runtime.get(
+        "public_ip"
+    )
+
+    if not ip:
+        ip = get_public_ip()
+
+    return jsonify(
+        {
+            "success": bool(ip),
+            "ip": ip,
+        }
+    )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
 
 HTML = r"""
 <!doctype html>
 <html>
 <head>
+<meta charset="utf-8">
 
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+/>
 
 <title>Prime Minister AI</title>
 
@@ -2439,243 +2285,260 @@ HTML = r"""
 
 body {
     margin: 0;
-    font-family: Arial, sans-serif;
-    background: #0f1217;
-    color: #f4f5f7;
+    background: #07111f;
+    color: #e8eef7;
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
 }
 
 header {
-    padding: 20px;
-    background: #171b22;
-    border-bottom: 1px solid #303640;
+    padding: 18px;
+    border-bottom: 1px solid #1b2a3e;
+    background: #091625;
 }
 
 h1 {
     margin: 0;
-    font-size: 25px;
+    font-size: 23px;
 }
 
 .subtitle {
     margin-top: 5px;
-    color: #9ea7b4;
+    color: #8294aa;
     font-size: 13px;
 }
 
 .container {
-    width: 100%;
-    max-width: 1000px;
+    max-width: 1200px;
     margin: auto;
-    padding: 15px;
+    padding: 16px;
 }
 
-.card {
-    background: #181d25;
-    border: 1px solid #303640;
-    border-radius: 14px;
-    padding: 16px;
+.topbar {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit,minmax(180px,1fr));
+    gap: 10px;
     margin-bottom: 15px;
 }
 
-.status {
-    font-size: 23px;
-    font-weight: bold;
-}
-
-.status-on {
-    color: #62d98b;
-}
-
-.status-off {
-    color: #ff7777;
-}
-
-.coin-grid {
-    display: grid;
-    grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(145px, 1fr)
-        );
-    gap: 10px;
-}
-
-.coin-card {
-    background: #202630;
-    border: 2px solid #343c49;
-    border-radius: 13px;
+.panel {
+    background: #0b1828;
+    border: 1px solid #1b2a3e;
+    border-radius: 14px;
     padding: 14px;
-    cursor: pointer;
-    transition: 0.15s;
 }
 
-.coin-card:hover {
-    border-color: #758197;
-}
-
-.coin-card.selected {
-    border-color: #67a6ff;
-}
-
-.coin-card.in-trade {
-    border-color: #ffbd58;
-}
-
-.coin-name {
-    font-size: 20px;
-    font-weight: bold;
-}
-
-.signal {
-    margin-top: 7px;
-    font-weight: bold;
-}
-
-.signal-long {
-    color: #5ee28b;
-}
-
-.signal-short {
-    color: #ff7e7e;
-}
-
-.signal-none {
-    color: #a9b1bd;
-}
-
-.coin-small {
-    margin-top: 7px;
+.label {
+    color: #7e91a8;
     font-size: 12px;
-    color: #9da6b2;
 }
 
-.coin-on {
-    margin-top: 10px;
-    color: #62d98b;
-    font-weight: bold;
+.value {
+    font-size: 20px;
+    font-weight: 700;
+    margin-top: 4px;
 }
 
-.coin-off {
-    margin-top: 10px;
-    color: #9098a5;
+.green {
+    color: #45e09b;
+}
+
+.red {
+    color: #ff6577;
+}
+
+.yellow {
+    color: #ffc857;
+}
+
+.gray {
+    color: #91a0b5;
+}
+
+.controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 button,
 select,
 input {
-    width: 100%;
-    border: 1px solid #3b4350;
-    background: #222832;
+    background: #101f32;
     color: white;
+    border: 1px solid #2a405a;
     border-radius: 9px;
-    padding: 12px;
-    font-size: 15px;
+    padding: 10px 12px;
+    font-size: 14px;
 }
 
 button {
     cursor: pointer;
 }
 
-button.primary {
-    background: #284d7a;
+button:hover {
+    background: #172b43;
 }
 
-button.danger {
-    background: #562c31;
+.coin-grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit,minmax(210px,1fr));
+    gap: 12px;
 }
 
-.row {
+.coin {
+    cursor: pointer;
+    transition: .15s;
+}
+
+.coin:hover {
+    transform: translateY(-2px);
+    border-color: #52759d;
+}
+
+.coin.on {
+    border-color: #45e09b;
+}
+
+.coin-title {
     display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
 }
 
-.row > * {
-    flex: 1;
-    min-width: 130px;
+.coin-name {
+    font-size: 17px;
+    font-weight: 700;
 }
 
-.small {
-    color: #9da6b2;
+.badge {
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: #16263a;
+}
+
+.signal {
+    font-size: 21px;
+    font-weight: 800;
+    margin: 15px 0 4px;
+}
+
+.price {
+    font-size: 15px;
+}
+
+.reason {
+    margin-top: 10px;
+    color: #8294aa;
+    font-size: 12px;
+    min-height: 32px;
+}
+
+.meta {
+    margin-top: 12px;
+    display: flex;
+    justify-content: space-between;
+    color: #9aacbf;
     font-size: 12px;
 }
 
-pre {
-    white-space: pre-wrap;
-    word-break: break-word;
+.section {
+    margin-top: 16px;
 }
 
-.event {
-    border-bottom: 1px solid #2b313b;
-    padding: 9px 0;
-    font-size: 13px;
+.trade-box {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit,minmax(150px,1fr));
+    gap: 10px;
+}
+
+.event-list {
+    max-height: 250px;
+    overflow: auto;
+}
+
+.event-item {
+    padding: 8px 0;
+    border-bottom: 1px solid #18273a;
+    font-size: 12px;
+    color: #a9b8ca;
 }
 
 .modal {
-    display: none;
     position: fixed;
     inset: 0;
-    background: rgba(
-        0,
-        0,
-        0,
-        0.72
-    );
-    z-index: 100;
+    background: rgba(0,0,0,.7);
+    display: none;
+    align-items: center;
+    justify-content: center;
     padding: 15px;
-    overflow-y: auto;
+    z-index: 50;
 }
 
 .modal.show {
     display: flex;
-    align-items: center;
-    justify-content: center;
 }
 
 .modal-box {
     width: 100%;
-    max-width: 520px;
-    background: #181d25;
-    border: 1px solid #3c4553;
+    max-width: 480px;
+    max-height: 90vh;
+    overflow: auto;
+    background: #0b1828;
+    border: 1px solid #2a405a;
     border-radius: 16px;
     padding: 18px;
 }
 
-.rule-grid {
-    display: grid;
-    grid-template-columns:
-        1fr 1fr;
-    gap: 8px;
-    margin: 12px 0;
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.form-row {
+    margin-top: 12px;
+}
+
+.form-row label {
+    display: block;
+    color: #8ea0b4;
+    font-size: 12px;
+    margin-bottom: 5px;
+}
+
+.form-row input,
+.form-row select {
+    width: 100%;
 }
 
 .rule {
-    background: #202630;
-    border-radius: 9px;
-    padding: 10px;
+    display: flex;
+    justify-content: space-between;
+    padding: 7px 0;
+    border-bottom: 1px solid #18273a;
+    font-size: 12px;
 }
 
-.rule-label {
-    color: #929ba8;
+.rule span:first-child {
+    color: #8497ac;
+}
+
+.small {
+    color: #71849a;
     font-size: 11px;
 }
 
-.rule-value {
-    margin-top: 4px;
-    font-weight: bold;
-}
-
-.error {
-    color: #ff7c7c;
-    margin: 10px 0;
-}
-
-.success {
-    color: #65dc8b;
-    margin: 10px 0;
-}
-
 </style>
-
 </head>
 
 <body>
@@ -2683,188 +2546,212 @@ pre {
 <header>
     <h1>Prime Minister AI</h1>
     <div class="subtitle">
-        Deterministic trading commander
+        Autonomous Delta Trading Commander
     </div>
 </header>
 
 <div class="container">
 
-<div class="card">
+    <div class="topbar">
 
-    <div class="status">
-        System:
-        <span id="systemStatus"
-              class="status-off">
-            OFF
-        </span>
+        <div class="panel">
+            <div class="label">SYSTEM</div>
+            <div id="system" class="value gray">
+                OFF
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="label">MODE</div>
+            <div id="mode" class="value">
+                PAPER
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="label">SELECTED COIN</div>
+            <div id="selected" class="value">
+                None
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="label">STRONGEST SIGNAL</div>
+            <div id="strongest" class="value">
+                None
+            </div>
+        </div>
+
     </div>
 
-    <div class="small"
-         style="margin-top:7px;">
-        Selected coin:
-        <b id="selectedCoin">
-            None
-        </b>
+    <div class="panel">
+
+        <div class="controls">
+
+            <button onclick="systemToggle()">
+                SYSTEM ON / OFF
+            </button>
+
+            <button onclick="setMode('PAPER')">
+                PAPER
+            </button>
+
+            <button onclick="setMode('LIVE')">
+                LIVE
+            </button>
+
+            <button onclick="manualClose()">
+                CLOSE CURRENT TRADE
+            </button>
+
+        </div>
+
     </div>
 
-    <br>
+    <div class="section">
 
-    <div class="row">
+        <div class="panel">
 
-        <button class="primary"
-                onclick="startSystem()">
-            SYSTEM ON
-        </button>
+            <div class="label">
+                TOP 5 MARKET WATCH
+            </div>
 
-        <button
-                onclick="stopSystem()">
-            SYSTEM OFF
-        </button>
+            <div
+                id="coins"
+                class="coin-grid"
+                style="margin-top:12px"
+            ></div>
 
-        <button class="danger"
-                onclick="manualClose()">
-            MANUAL CLOSE
-        </button>
+        </div>
+
+    </div>
+
+    <div class="section">
+
+        <div class="panel">
+
+            <div class="label">
+                CURRENT TRADE
+            </div>
+
+            <div
+                id="trade"
+                style="margin-top:12px"
+            >
+                None
+            </div>
+
+        </div>
+
+    </div>
+
+    <div class="section">
+
+        <div class="panel">
+
+            <div class="label">
+                CONNECTIONS
+            </div>
+
+            <div
+                id="connections"
+                style="margin-top:12px"
+            ></div>
+
+        </div>
+
+    </div>
+
+    <div class="section">
+
+        <div class="panel">
+
+            <div class="label">
+                EVENTS
+            </div>
+
+            <div
+                id="events"
+                class="event-list"
+                style="margin-top:12px"
+            ></div>
+
+        </div>
 
     </div>
 
 </div>
 
 
-<div class="card">
-
-    <h2>Top 5 Coins</h2>
-
-    <div class="small"
-         style="margin-bottom:12px;">
-        Tap a coin to configure its
-        Delta-specific quantity and leverage.
-        Only one coin can be ON.
-    </div>
-
-    <div id="coinGrid"
-         class="coin-grid">
-    </div>
-
-</div>
-
-
-<div class="card">
-
-    <h2>Current Trade</h2>
-
-    <pre id="trade">
-None
-    </pre>
-
-</div>
-
-
-<div class="card">
-
-    <h2>Latest Signal</h2>
-
-    <pre id="signal">
-None
-    </pre>
-
-</div>
-
-
-<div class="card">
-
-    <h2>Public IP</h2>
-
-    <div id="ip">
-        Not checked
-    </div>
-
-    <br>
-
-    <button onclick="refreshIP()">
-        CHECK IP
-    </button>
-
-</div>
-
-
-<div class="card">
-
-    <h2>Events</h2>
-
-    <div id="events">
-    </div>
-
-</div>
-
-</div>
-
-
-<div id="coinModal"
-     class="modal">
+<div id="modal" class="modal">
 
     <div class="modal-box">
 
-        <h2 id="modalTitle">
-            BTCUSD
-        </h2>
+        <div class="modal-header">
 
-        <div id="modalError"
-             class="error">
+            <div>
+                <div
+                    id="modalTitle"
+                    style="
+                    font-size:20px;
+                    font-weight:800;
+                    "
+                ></div>
+
+                <div
+                    id="modalSubtitle"
+                    class="small"
+                ></div>
+            </div>
+
+            <button onclick="closeModal()">
+                X
+            </button>
+
         </div>
 
-        <h3>Delta Rules</h3>
+        <div
+            id="rules"
+            style="margin-top:14px"
+        ></div>
 
-        <div id="rules"
-             class="rule-grid">
+        <div class="form-row">
+
+            <label>
+                Quantity
+            </label>
+
+            <input
+                id="quantity"
+                type="number"
+                step="any"
+            />
+
         </div>
 
-        <h3>Your Settings</h3>
+        <div class="form-row">
 
-        <label>
-            Quantity
-        </label>
+            <label>
+                Leverage
+            </label>
 
-        <input id="coinQuantity"
-               type="number"
-               min="0"
-               step="any">
+            <select id="leverage"></select>
 
-        <br><br>
+        </div>
 
-        <label>
-            Leverage
-        </label>
+        <div
+            class="controls"
+            style="margin-top:16px"
+        >
 
-        <input id="coinLeverage"
-               type="number"
-               min="0"
-               step="any">
-
-        <br><br>
-
-        <div class="row">
-
-            <button class="primary"
-                    onclick="saveCoin()">
+            <button onclick="saveSettings()">
                 SAVE SETTINGS
             </button>
 
-            <button
-                    onclick="toggleCoin()">
+            <button onclick="toggleSelectedCoin()">
                 ON / OFF
             </button>
 
-            <button
-                    onclick="closeModal()">
-                CLOSE
-            </button>
-
-        </div>
-
-        <div id="modalMessage"
-             class="small"
-             style="margin-top:12px;">
         </div>
 
     </div>
@@ -2874,785 +2761,832 @@ None
 
 <script>
 
-const SYMBOLS = [
-    "BTCUSD",
-    "ETHUSD",
-    "SOLUSD",
-    "XRPUSD",
-    "DOGEUSD"
-];
-
-let currentSymbol = null;
-let currentRules = null;
+let appState = null;
+let selectedModalCoin = null;
+let selectedRules = null;
 
 
-async function api(
-    url,
-    options = {}
-) {
-    const response = await fetch(
-        url,
+function money(value) {
+
+    if (value === null ||
+        value === undefined) {
+        return "--";
+    }
+
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "--";
+    }
+
+    if (n >= 1000) {
+        return n.toLocaleString(
+            undefined,
+            {
+                maximumFractionDigits: 2
+            }
+        );
+    }
+
+    return n.toLocaleString(
+        undefined,
         {
-            headers: {
-                "Content-Type":
-                    "application/json"
-            },
-            ...options
+            maximumFractionDigits: 8
         }
     );
+}
+
+
+function signalClass(side) {
+
+    if (side === "LONG") {
+        return "green";
+    }
+
+    if (side === "SHORT") {
+        return "red";
+    }
+
+    return "gray";
+}
+
+
+function render(state) {
+
+    appState = state;
+
+    const system =
+        document.getElementById("system");
+
+    system.innerText =
+        state.system_on ? "ON" : "OFF";
+
+    system.className =
+        "value " +
+        (state.system_on
+            ? "green"
+            : "gray");
+
+    document.getElementById(
+        "mode"
+    ).innerText = state.mode;
+
+    document.getElementById(
+        "selected"
+    ).innerText =
+        state.selected_coin || "None";
+
+    const strongest =
+        state.strongest_signal;
+
+    document.getElementById(
+        "strongest"
+    ).innerHTML =
+        strongest
+        ? `
+            <span class="${signalClass(
+                strongest.side
+            )}">
+                ${strongest.symbol}
+                ${strongest.side}
+                ${strongest.score}
+            </span>
+          `
+        : "None";
+
+
+    const coins =
+        document.getElementById("coins");
+
+    coins.innerHTML = "";
+
+    for (const symbol of [
+        "BTCUSD",
+        "ETHUSD",
+        "SOLUSD",
+        "XRPUSD",
+        "DOGEUSD"
+    ]) {
+
+        const coin =
+            state.coins[symbol];
+
+        const signal =
+            coin.last_signal || {};
+
+        const div =
+            document.createElement("div");
+
+        div.className =
+            "panel coin " +
+            (coin.enabled ? "on" : "");
+
+        div.onclick = () =>
+            openCoin(symbol);
+
+        div.innerHTML = `
+
+            <div class="coin-title">
+
+                <div class="coin-name">
+                    ${symbol}
+                </div>
+
+                <div class="badge">
+                    ${coin.enabled
+                        ? "ON"
+                        : "OFF"}
+                </div>
+
+            </div>
+
+            <div
+                class="signal
+                ${signalClass(
+                    signal.side
+                )}"
+            >
+                ${signal.side || "NO_TRADE"}
+            </div>
+
+            <div class="price">
+                ${money(signal.price)}
+            </div>
+
+            <div class="reason">
+                ${signal.reason || ""}
+            </div>
+
+            <div class="meta">
+
+                <span>
+                    Score:
+                    ${signal.score ?? 0}
+                </span>
+
+                <span>
+                    Qty:
+                    ${coin.quantity}
+                </span>
+
+                <span>
+                    ${coin.leverage}x
+                </span>
+
+            </div>
+
+        `;
+
+        coins.appendChild(div);
+    }
+
+
+    renderTrade(state);
+    renderConnections(state);
+    renderEvents(state);
+}
+
+
+function renderTrade(state) {
+
+    const box =
+        document.getElementById("trade");
+
+    const trade =
+        state.current_trade;
+
+    if (!trade) {
+        box.innerHTML =
+            `<span class="gray">
+                No active trade
+            </span>`;
+
+        return;
+    }
+
+    box.innerHTML = `
+
+        <div class="trade-box">
+
+            <div>
+                <div class="label">
+                    SYMBOL
+                </div>
+                <div class="value">
+                    ${trade.symbol}
+                </div>
+            </div>
+
+            <div>
+                <div class="label">
+                    SIDE
+                </div>
+                <div
+                    class="value
+                    ${signalClass(
+                        trade.side
+                    )}"
+                >
+                    ${trade.side}
+                </div>
+            </div>
+
+            <div>
+                <div class="label">
+                    ENTRY
+                </div>
+                <div class="value">
+                    ${money(
+                        trade.entry
+                    )}
+                </div>
+            </div>
+
+            <div>
+                <div class="label">
+                    QTY
+                </div>
+                <div class="value">
+                    ${trade.quantity}
+                </div>
+            </div>
+
+            <div>
+                <div class="label">
+                    LEVERAGE
+                </div>
+                <div class="value">
+                    ${trade.leverage}x
+                </div>
+            </div>
+
+            <div>
+                <div class="label">
+                    MODE
+                </div>
+                <div class="value">
+                    ${trade.mode}
+                </div>
+            </div>
+
+        </div>
+    `;
+}
+
+
+function renderConnections(state) {
+
+    const cmc =
+        state.cmc || {};
+
+    document.getElementById(
+        "connections"
+    ).innerHTML = `
+
+        <div class="rule">
+
+            <span>Delta API</span>
+
+            <span class="${
+                state.runtime &&
+                state.runtime.last_scan_error
+                    ? "red"
+                    : "green"
+            }">
+                ${
+                    state.runtime &&
+                    state.runtime.last_scan_error
+                        ? "ERROR"
+                        : "READY"
+                }
+            </span>
+
+        </div>
+
+        <div class="rule">
+
+            <span>CMC</span>
+
+            <span class="${
+                cmc.connected
+                    ? "green"
+                    : "yellow"
+            }">
+                ${
+                    cmc.connected
+                        ? (
+                            cmc.cached
+                                ? "CONNECTED / CACHED"
+                                : "CONNECTED"
+                        )
+                        : "NOT CONNECTED"
+                }
+            </span>
+
+        </div>
+
+        <div class="rule">
+
+            <span>Public IP</span>
+
+            <span>
+                ${
+                    state.runtime &&
+                    state.runtime.public_ip
+                        ? state.runtime.public_ip
+                        : "--"
+                }
+            </span>
+
+        </div>
+
+        <div class="rule">
+
+            <span>Engine</span>
+
+            <span class="${
+                state.engine_running
+                    ? "green"
+                    : "gray"
+            }">
+                ${
+                    state.engine_running
+                        ? "RUNNING"
+                        : "STOPPED"
+                }
+            </span>
+
+        </div>
+
+    `;
+}
+
+
+function renderEvents(state) {
+
+    const box =
+        document.getElementById("events");
+
+    box.innerHTML = "";
+
+    for (
+        const item of
+        (state.events || [])
+    ) {
+
+        const div =
+            document.createElement("div");
+
+        div.className =
+            "event-item";
+
+        div.innerText =
+            `${item.time} — ${item.message}`;
+
+        box.appendChild(div);
+    }
+}
+
+
+async function loadState() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/state",
+                {
+                    cache: "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        render(data);
+
+    } catch (error) {
+
+        console.error(error);
+    }
+}
+
+
+async function systemToggle() {
+
+    if (!appState) {
+        return;
+    }
+
+    const enabled =
+        !appState.system_on;
+
+    const response =
+        await fetch(
+            "/api/system",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    enabled
+                })
+            }
+        );
 
     const data =
         await response.json();
 
-    if (!response.ok) {
-        throw new Error(
-            data.error ||
-            "Request failed"
-        );
+    if (!data.success) {
+        alert(data.error);
     }
 
-    return data;
+    await loadState();
 }
 
 
-function pretty(value) {
-    if (
-        value === null ||
-        value === undefined
-    ) {
-        return "None";
-    }
+async function setMode(mode) {
 
-    return JSON.stringify(
-        value,
-        null,
-        2
-    );
-}
-
-
-function signalClass(
-    direction
-) {
-    if (
-        direction === "LONG"
-    ) {
-        return "signal-long";
-    }
-
-    if (
-        direction === "SHORT"
-    ) {
-        return "signal-short";
-    }
-
-    return "signal-none";
-}
-
-
-function signalText(
-    coin
-) {
-    const signal =
-        coin.last_signal;
-
-    if (!signal) {
-        return "NO SIGNAL";
-    }
-
-    return (
-        signal.direction +
-        " • " +
-        signal.score
-    );
-}
-
-
-function renderCoins(
-    state
-) {
-    const grid =
-        document.getElementById(
-            "coinGrid"
-        );
-
-    grid.innerHTML = "";
-
-    const selected =
-        Object.keys(
-            state.coins
-        ).find(
-            symbol =>
-                state.coins[
-                    symbol
-                ].enabled
-        );
-
-    SYMBOLS.forEach(
-        function(symbol) {
-
-            const coin =
-                state.coins[
-                    symbol
-                ] || {};
-
-            const signal =
-                coin.last_signal;
-
-            const card =
-                document.createElement(
-                    "div"
-                );
-
-            card.className =
-                "coin-card";
-
-            if (
-                coin.enabled
-            ) {
-                card.classList.add(
-                    "selected"
-                );
+    const response =
+        await fetch(
+            "/api/mode",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    mode
+                })
             }
+        );
 
-            if (
-                state.trade &&
-                state.trade.symbol
-                === symbol
-            ) {
-                card.classList.add(
-                    "in-trade"
-                );
-            }
+    const data =
+        await response.json();
 
-            const name =
-                document.createElement(
-                    "div"
-                );
+    if (!data.success) {
+        alert(data.error);
+    }
 
-            name.className =
-                "coin-name";
-
-            name.textContent =
-                symbol.replace(
-                    "USD",
-                    ""
-                );
-
-            const sig =
-                document.createElement(
-                    "div"
-                );
-
-            sig.className =
-                "signal " +
-                signalClass(
-                    signal
-                        ? signal.direction
-                        : "NO_TRADE"
-                );
-
-            sig.textContent =
-                signalText(
-                    coin
-                );
-
-            const config =
-                document.createElement(
-                    "div"
-                );
-
-            config.className =
-                "coin-small";
-
-            config.textContent =
-                "Qty: " +
-                (
-                    coin.quantity
-                    ?? "Not set"
-                ) +
-                " | Lev: " +
-                (
-                    coin.leverage
-                    ?? "Not set"
-                );
-
-            const status =
-                document.createElement(
-                    "div"
-                );
-
-            status.className =
-                coin.enabled
-                    ? "coin-on"
-                    : "coin-off";
-
-            status.textContent =
-                coin.enabled
-                    ? "● ON"
-                    : "○ OFF";
-
-            card.appendChild(
-                name
-            );
-
-            card.appendChild(
-                sig
-            );
-
-            card.appendChild(
-                config
-            );
-
-            card.appendChild(
-                status
-            );
-
-            card.onclick =
-                function() {
-                    openCoin(
-                        symbol
-                    );
-                };
-
-            grid.appendChild(
-                card
-            );
-        }
-    );
-
-    document.getElementById(
-        "selectedCoin"
-    ).textContent =
-        selected || "None";
+    await loadState();
 }
 
 
-async function openCoin(
-    symbol
-) {
-    currentSymbol =
-        symbol;
+async function manualClose() {
+
+    const response =
+        await fetch(
+            "/api/trade/close",
+            {
+                method: "POST"
+            }
+        );
+
+    const data =
+        await response.json();
+
+    if (!data.success) {
+        alert(data.error);
+    }
+
+    await loadState();
+}
+
+
+async function openCoin(symbol) {
+
+    selectedModalCoin = symbol;
+
+    const coin =
+        appState.coins[symbol];
 
     document.getElementById(
         "modalTitle"
-    ).textContent =
-        symbol;
+    ).innerText = symbol;
 
     document.getElementById(
-        "modalError"
-    ).textContent =
-        "";
+        "modalSubtitle"
+    ).innerText =
+        "Delta product rules";
 
     document.getElementById(
-        "modalMessage"
-    ).textContent =
-        "Loading Delta product rules...";
+        "quantity"
+    ).value =
+        coin.quantity;
+
+    await loadRules(symbol);
 
     document.getElementById(
-        "coinModal"
-    ).classList.add(
-        "show"
-    );
+        "modal"
+    ).classList.add("show");
+}
+
+
+async function loadRules(symbol) {
 
     try {
 
-        const data =
-            await api(
-                "/api/coin/" +
-                symbol
+        const response =
+            await fetch(
+                `/api/coin/${symbol}/rules`,
+                {
+                    cache: "no-store"
+                }
             );
 
-        currentRules =
+        const data =
+            await response.json();
+
+        if (!data.success) {
+            alert(data.error);
+            return;
+        }
+
+        selectedRules =
             data.rules;
 
         renderRules(
             data.rules
         );
 
-        const config =
-            data.config || {};
+    } catch (error) {
 
-        document.getElementById(
-            "coinQuantity"
-        ).value =
-            config.quantity ??
-            "";
-
-        document.getElementById(
-            "coinLeverage"
-        ).value =
-            config.leverage ??
-            "";
-
-        document.getElementById(
-            "modalMessage"
-        ).textContent =
-            config.enabled
-                ? "This coin is currently ON."
-                : "This coin is currently OFF.";
-
-    } catch (e) {
-
-        document.getElementById(
-            "modalError"
-        ).textContent =
-            e.message;
-
-        document.getElementById(
-            "modalMessage"
-        ).textContent =
-            "";
+        alert(
+            "Failed to load Delta rules"
+        );
     }
 }
 
 
-function renderRules(
-    rules
-) {
+function renderRules(rules) {
+
     const box =
+        document.getElementById("rules");
+
+    if (!rules.available) {
+
+        box.innerHTML = `
+            <div class="red">
+                ${
+                    rules.message ||
+                    "Delta rules unavailable"
+                }
+            </div>
+        `;
+
+        return;
+    }
+
+    box.innerHTML = `
+
+        <div class="rule">
+            <span>Trading status</span>
+            <span>
+                ${rules.trading_status ?? "--"}
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Minimum quantity</span>
+            <span>
+                ${rules.min_quantity ?? "--"}
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Maximum quantity</span>
+            <span>
+                ${rules.max_quantity ?? "--"}
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Quantity step</span>
+            <span>
+                ${rules.quantity_step ?? "--"}
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Minimum leverage</span>
+            <span>
+                ${
+                    rules.min_leverage ??
+                    "--"
+                }x
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Maximum leverage</span>
+            <span>
+                ${
+                    rules.max_leverage ??
+                    "--"
+                }x
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Default leverage</span>
+            <span>
+                ${
+                    rules.default_leverage ??
+                    "--"
+                }x
+            </span>
+        </div>
+
+        <div class="rule">
+            <span>Tick size</span>
+            <span>
+                ${rules.tick_size ?? "--"}
+            </span>
+        </div>
+
+    `;
+
+
+    const select =
         document.getElementById(
-            "rules"
+            "leverage"
         );
 
-    box.innerHTML = "";
+    select.innerHTML = "";
 
-    const items = [
-        [
-            "Product ID",
-            rules.product_id
-        ],
-        [
-            "Minimum Quantity",
-            rules.minimum_quantity
-        ],
-        [
-            "Maximum Quantity",
-            rules.maximum_quantity
-        ],
-        [
-            "Quantity Step",
-            rules.quantity_step
-        ],
-        [
-            "Minimum Leverage",
-            rules.minimum_leverage
-        ],
-        [
-            "Maximum Leverage",
-            rules.maximum_leverage
-        ],
-        [
-            "Trading Status",
-            rules.trading_status
-        ],
-        [
-            "Contract Value",
-            rules.contract_value
-        ]
+    const min =
+        Number.isFinite(
+            Number(rules.min_leverage)
+        )
+        ? Number(rules.min_leverage)
+        : 1;
+
+    const max =
+        Number.isFinite(
+            Number(rules.max_leverage)
+        )
+        ? Number(rules.max_leverage)
+        : 100;
+
+    const common = [
+        1,
+        2,
+        3,
+        5,
+        10,
+        15,
+        20,
+        25,
+        30,
+        40,
+        50,
+        75,
+        100
     ];
 
-    items.forEach(
-        function(item) {
-
-            const rule =
-                document.createElement(
-                    "div"
-                );
-
-            rule.className =
-                "rule";
-
-            const label =
-                document.createElement(
-                    "div"
-                );
-
-            label.className =
-                "rule-label";
-
-            label.textContent =
-                item[0];
-
-            const value =
-                document.createElement(
-                    "div"
-                );
-
-            value.className =
-                "rule-value";
-
-            value.textContent =
-                item[1] ??
-                "Not supplied by Delta";
-
-            rule.appendChild(
-                label
-            );
-
-            rule.appendChild(
-                value
-            );
-
-            box.appendChild(
-                rule
-            );
-        }
-    );
-}
-
-
-async function saveCoin() {
-
-    if (!currentSymbol) {
-        return;
-    }
-
-    const quantity =
-        document.getElementById(
-            "coinQuantity"
-        ).value;
-
-    const leverage =
-        document.getElementById(
-            "coinLeverage"
-        ).value;
-
-    try {
-
-        const status =
-            await api(
-                "/api/status"
-            );
-
-        const existing =
-            status.coins[
-                currentSymbol
-            ];
-
-        const data =
-            await api(
-                "/api/coin/" +
-                currentSymbol,
-                {
-                    method: "POST",
-                    body: JSON.stringify(
-                        {
-                            enabled:
-                                existing
-                                    ? existing.enabled
-                                    : false,
-                            quantity:
-                                Number(
-                                    quantity
-                                ),
-                            leverage:
-                                Number(
-                                    leverage
-                                )
-                        }
-                    )
-                }
-            );
-
-        document.getElementById(
-            "modalMessage"
-        ).textContent =
-            "Settings saved.";
-
-        refresh();
-
-    } catch (e) {
-
-        document.getElementById(
-            "modalError"
-        ).textContent =
-            e.message;
-    }
-}
-
-
-async function toggleCoin() {
-
-    if (!currentSymbol) {
-        return;
-    }
-
-    try {
-
-        const status =
-            await api(
-                "/api/status"
-            );
-
-        const coin =
-            status.coins[
-                currentSymbol
-            ];
-
-        const next =
-            !coin.enabled;
-
-        await api(
-            "/api/coin/" +
-            currentSymbol +
-            "/toggle",
-            {
-                method: "POST",
-                body: JSON.stringify(
-                    {
-                        enabled: next
-                    }
-                )
-            }
+    const values =
+        common.filter(
+            value =>
+                value >= min &&
+                value <= max
         );
 
-        document.getElementById(
-            "modalMessage"
-        ).textContent =
-            next
-                ? currentSymbol +
-                  " is now ON."
-                : currentSymbol +
-                  " is now OFF.";
+    if (values.length === 0) {
+        values.push(min);
+    }
 
-        refresh();
+    for (
+        const value of values
+    ) {
 
-    } catch (e) {
+        const option =
+            document.createElement(
+                "option"
+            );
 
-        document.getElementById(
-            "modalError"
-        ).textContent =
-            e.message;
+        option.value = value;
+        option.innerText =
+            `${value}x`;
+
+        if (
+            appState.coins[
+                selectedModalCoin
+            ].leverage == value
+        ) {
+            option.selected = true;
+        }
+
+        select.appendChild(option);
     }
 }
 
 
 function closeModal() {
+
     document.getElementById(
-        "coinModal"
-    ).classList.remove(
-        "show"
-    );
+        "modal"
+    ).classList.remove("show");
 }
 
 
-async function startSystem() {
+async function saveSettings() {
 
-    try {
-
-        await api(
-            "/api/start",
-            {
-                method: "POST"
-            }
-        );
-
-        refresh();
-
-    } catch (e) {
-
-        alert(
-            e.message
-        );
-    }
-}
-
-
-async function stopSystem() {
-
-    try {
-
-        await api(
-            "/api/stop",
-            {
-                method: "POST"
-            }
-        );
-
-        refresh();
-
-    } catch (e) {
-
-        alert(
-            e.message
-        );
-    }
-}
-
-
-async function manualClose() {
-
-    if (
-        !confirm(
-            "Close current trade?"
-        )
-    ) {
+    if (!selectedModalCoin) {
         return;
     }
 
-    try {
+    const quantity =
+        Number(
+            document.getElementById(
+                "quantity"
+            ).value
+        );
 
-        await api(
-            "/api/close",
+    const leverage =
+        Number(
+            document.getElementById(
+                "leverage"
+            ).value
+        );
+
+    const response =
+        await fetch(
+            `/api/coin/${selectedModalCoin}/settings`,
             {
-                method: "POST"
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    quantity,
+                    leverage
+                })
             }
         );
 
-        refresh();
+    const data =
+        await response.json();
 
-    } catch (e) {
-
-        alert(
-            e.message
-        );
+    if (!data.success) {
+        alert(data.error);
+        return;
     }
+
+    closeModal();
+
+    await loadState();
 }
 
 
-async function refreshIP() {
+async function toggleSelectedCoin() {
 
-    try {
-
-        const data =
-            await api(
-                "/api/ip"
-            );
-
-        document.getElementById(
-            "ip"
-        ).textContent =
-            data.ip ||
-            "Unable to detect";
-
-    } catch (e) {
-
-        document.getElementById(
-            "ip"
-        ).textContent =
-            "Unable to detect";
+    if (!selectedModalCoin) {
+        return;
     }
-}
 
+    const current =
+        appState.coins[
+            selectedModalCoin
+        ].enabled;
 
-async function refresh() {
-
-    try {
-
-        const data =
-            await api(
-                "/api/status"
-            );
-
-        const status =
-            document.getElementById(
-                "systemStatus"
-            );
-
-        status.textContent =
-            data.enabled
-                ? "ON"
-                : "OFF";
-
-        status.className =
-            data.enabled
-                ? "status-on"
-                : "status-off";
-
-        document.getElementById(
-            "trade"
-        ).textContent =
-            pretty(
-                data.trade
-            );
-
-        document.getElementById(
-            "signal"
-        ).textContent =
-            pretty(
-                data.last_signal
-            );
-
-        document.getElementById(
-            "ip"
-        ).textContent =
-            data.last_ip ||
-            "Not checked";
-
-        renderCoins(
-            data
-        );
-
-        const events =
-            document.getElementById(
-                "events"
-            );
-
-        events.innerHTML = "";
-
-        (
-            data.events ||
-            []
-        ).forEach(
-            function(event) {
-
-                const div =
-                    document.createElement(
-                        "div"
-                    );
-
-                div.className =
-                    "event";
-
-                const time =
-                    document.createElement(
-                        "div"
-                    );
-
-                time.className =
-                    "small";
-
-                time.textContent =
-                    event.time ||
-                    "";
-
-                const message =
-                    document.createElement(
-                        "div"
-                    );
-
-                message.textContent =
-                    event.message ||
-                    "";
-
-                div.appendChild(
-                    time
-                );
-
-                div.appendChild(
-                    message
-                );
-
-                events.appendChild(
-                    div
-                );
+    const response =
+        await fetch(
+            `/api/coin/${selectedModalCoin}/toggle`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+                body: JSON.stringify({
+                    enabled: !current
+                })
             }
         );
 
-    } catch (e) {
+    const data =
+        await response.json();
 
-        console.error(e);
+    if (!data.success) {
+        alert(data.error);
+        return;
     }
+
+    closeModal();
+
+    await loadState();
 }
 
 
-refreshIP();
-refresh();
+loadState();
 
 setInterval(
-    refresh,
-    3000
+    loadState,
+    5000
 );
 
 </script>
@@ -3662,17 +3596,53 @@ setInterval(
 """
 
 
+# ============================================================
+# WEB
+# ============================================================
+
+@app.get("/")
+def index():
+    return render_template_string(
+        HTML
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def startup():
+    get_public_ip()
+
+    if API_KEY and API_SECRET:
+        reconcile_live_state()
+
+    # CMC is intentionally cached and not called
+    # every trading cycle.
+    refresh_cmc_if_needed(
+        force=False
+    )
+
+
+startup()
+
+
+# ============================================================
+# SERVER
+# ============================================================
+
 if __name__ == "__main__":
-    start_engine()
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "5000",
+        )
+    )
 
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "5000",
-            )
-        ),
+        port=port,
         debug=False,
         threaded=True,
     )
