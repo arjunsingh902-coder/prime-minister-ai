@@ -23,7 +23,7 @@ API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/5.0-Bulletproof"
+USER_AGENT = "PrimeMinisterAI/4.1-Final"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -59,7 +59,6 @@ runtime = {
     "last_scan": 0,
     "last_scan_error": None,
     "public_ip": None,
-    "is_scanning": False  # Live Heartbeat Sensor
 }
 
 # ============================================================
@@ -129,14 +128,14 @@ def event(message):
     save_state()
 
 # ============================================================
-# DELTA API CORE (STRICT TIMEOUTS & ERROR PARSING)
+# DELTA API CORE
 # ============================================================
 
 def delta_signature(method, timestamp, path, query_string="", body=""):
     message = method.upper() + str(timestamp) + path + query_string + body
     return hmac.new(API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def delta_request(method, path, params=None, body=None, authenticated=False, timeout=3):
+def delta_request(method, path, params=None, body=None, authenticated=False, timeout=10):
     url = DELTA_BASE + path
     params = params or {}
     body_text = "" if body is None else json.dumps(body, separators=(",", ":"))
@@ -151,21 +150,17 @@ def delta_request(method, path, params=None, body=None, authenticated=False, tim
         signature = delta_signature(method, timestamp, path, query_string, body_text)
         headers.update({"api-key": API_KEY, "timestamp": timestamp, "signature": signature})
 
-    try:
-        response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Timeout: Delta Server Slow/Unresponsive")
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("Connection Error: DNS or Blocked")
-    except Exception as e:
-        raise RuntimeError(f"Request Failed: {str(e)}")
-
+    response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
+    
     if response.status_code >= 400: 
         err_msg = response.text
         try:
             err_json = response.json()
             if "error" in err_json and "message" in err_json["error"]:
                 err_msg = err_json["error"]["message"]
+            elif "error" in err_json and "context" in err_json["error"]:
+                # Special parsing for the exact schema error you found
+                err_msg = json.dumps(err_json["error"])
         except Exception: pass
         raise RuntimeError(f"HTTP {response.status_code}: {err_msg}")
     
@@ -218,16 +213,37 @@ def set_delta_leverage(symbol, leverage):
     if not product or not product.get("id"): raise RuntimeError(f"{symbol}: Product ID missing")
     return delta_request("POST", f"/v2/products/{product['id']}/orders/leverage", body={"leverage": int(leverage)}, authenticated=True)
 
+# FIXED GET_CANDLES FUNCTION WITH START AND END TIMESTAMPS
 def get_candles(symbol, resolution="5m", limit=160):
-    data = delta_request("GET", "/v2/history/candles", params={"symbol": symbol, "resolution": resolution, "limit": limit}, authenticated=False)
+    end_time = int(time.time())
+    
+    # Calculate start time based on resolution
+    # Adding a 10 candle buffer just to be safe
+    if resolution == "1h":
+        start_time = end_time - ((limit + 10) * 3600)
+    else: # 5m
+        start_time = end_time - ((limit + 10) * 300)
+
+    params = {
+        "symbol": symbol, 
+        "resolution": resolution, 
+        "start": start_time,
+        "end": end_time
+    }
+    
+    data = delta_request("GET", "/v2/history/candles", params=params, authenticated=False)
     candles = []
+    
     for item in data.get("result", []):
         try:
             if isinstance(item, dict): candles.append({"time": float(item.get("time")), "open": float(item.get("open")), "high": float(item.get("high")), "low": float(item.get("low")), "close": float(item.get("close")), "volume": float(item.get("volume", 0))})
             else: candles.append({"time": float(item[0]), "open": float(item[1]), "high": float(item[2]), "low": float(item[3]), "close": float(item[4]), "volume": float(item[5]) if len(item) > 5 else 0})
         except Exception: continue
+        
     candles.sort(key=lambda x: x["time"])
-    return candles
+    
+    # Trim to exactly the limit requested
+    return candles[-limit:] if len(candles) > limit else candles
 
 def get_position_for_symbol(symbol):
     try:
@@ -255,7 +271,7 @@ def refresh_cmc_if_needed(force=False):
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
             params={"symbol": ",".join(x.replace("USD", "") for x in SYMBOLS), "convert": "USD"},
             headers={"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accepts": "application/json"},
-            timeout=5,
+            timeout=10,
         )
         response.raise_for_status()
         data = response.json().get("data", {})
@@ -464,7 +480,7 @@ def close_trade(price, reason):
     return True
 
 # ============================================================
-# MASTER SCANNER (ISOLATED ERRORS)
+# MASTER SCANNER
 # ============================================================
 
 def scan_all_coins():
@@ -485,8 +501,7 @@ def scan_all_coins():
             
             with lock: state["coins"][symbol]["last_signal"] = signal
             results[symbol] = signal
-            
-            time.sleep(0.3) # DONT SPAM DELTA
+            time.sleep(0.3) 
             
         except Exception as exc:
             has_global_error = True
@@ -503,7 +518,6 @@ def scan_all_coins():
     return results
 
 def trading_cycle():
-    runtime["is_scanning"] = True
     try:
         signals = scan_all_coins()
 
@@ -541,15 +555,13 @@ def trading_cycle():
 
     except Exception as exc:
         runtime["last_scan_error"] = f"Engine Error: {str(exc)}"
-    finally:
-        runtime["is_scanning"] = False
-        runtime["last_scan"] = time.time()
 
 def engine_loop():
     event("🟢 Background Scanner Engine Started.")
     while True:
         started = time.time()
         trading_cycle()
+        runtime["last_scan"] = time.time()
         time.sleep(max(0.5, SCAN_SECONDS - (time.time() - started)))
 
 # ============================================================
@@ -561,10 +573,7 @@ def api_state():
     with lock: snapshot = json.loads(json.dumps(state))
     cmc_status = refresh_cmc_if_needed(force=False)
     snapshot["runtime"] = runtime
-    
-    # Engine is running if actively scanning, OR finished a scan less than 15s ago
-    snapshot["engine_running"] = runtime["is_scanning"] or bool(time.time() - runtime["last_scan"] < 15)
-    
+    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15)
     snapshot["cmc_connected"] = cmc_status["connected"]
     snapshot["cmc_error"] = cmc_status["error"]
     return jsonify(snapshot)
