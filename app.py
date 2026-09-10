@@ -23,7 +23,7 @@ API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/4.0-Final"
+USER_AGENT = "PrimeMinisterAI/5.0-Bulletproof"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -59,6 +59,7 @@ runtime = {
     "last_scan": 0,
     "last_scan_error": None,
     "public_ip": None,
+    "is_scanning": False  # Live Heartbeat Sensor
 }
 
 # ============================================================
@@ -128,14 +129,14 @@ def event(message):
     save_state()
 
 # ============================================================
-# DELTA API CORE (WITH EXACT ERROR HANDLING)
+# DELTA API CORE (STRICT TIMEOUTS & ERROR PARSING)
 # ============================================================
 
 def delta_signature(method, timestamp, path, query_string="", body=""):
     message = method.upper() + str(timestamp) + path + query_string + body
     return hmac.new(API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def delta_request(method, path, params=None, body=None, authenticated=False, timeout=10):
+def delta_request(method, path, params=None, body=None, authenticated=False, timeout=3):
     url = DELTA_BASE + path
     params = params or {}
     body_text = "" if body is None else json.dumps(body, separators=(",", ":"))
@@ -150,9 +151,15 @@ def delta_request(method, path, params=None, body=None, authenticated=False, tim
         signature = delta_signature(method, timestamp, path, query_string, body_text)
         headers.update({"api-key": API_KEY, "timestamp": timestamp, "signature": signature})
 
-    response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
-    
-    # EXACT ERROR PARSING
+    try:
+        response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Timeout: Delta Server Slow/Unresponsive")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Connection Error: DNS or Blocked")
+    except Exception as e:
+        raise RuntimeError(f"Request Failed: {str(e)}")
+
     if response.status_code >= 400: 
         err_msg = response.text
         try:
@@ -248,7 +255,7 @@ def refresh_cmc_if_needed(force=False):
             "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
             params={"symbol": ",".join(x.replace("USD", "") for x in SYMBOLS), "convert": "USD"},
             headers={"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accepts": "application/json"},
-            timeout=10,
+            timeout=5,
         )
         response.raise_for_status()
         data = response.json().get("data", {})
@@ -457,11 +464,13 @@ def close_trade(price, reason):
     return True
 
 # ============================================================
-# MASTER SCANNER
+# MASTER SCANNER (ISOLATED ERRORS)
 # ============================================================
 
 def scan_all_coins():
     results = {}
+    has_global_error = False
+    
     for symbol in SYMBOLS:
         try:
             candles_1h = get_candles(symbol, "1h", CANDLE_LIMIT_HTF)
@@ -476,17 +485,27 @@ def scan_all_coins():
             
             with lock: state["coins"][symbol]["last_signal"] = signal
             results[symbol] = signal
-            time.sleep(0.2) # Rate Limit Protection Delay
+            
+            time.sleep(0.3) # DONT SPAM DELTA
+            
         except Exception as exc:
-            with lock: state["coins"][symbol]["last_signal"] = {"side": "NO_TRADE", "score": 0, "price": None, "reason": f"Scan Error"}
-            raise exc 
+            has_global_error = True
+            err_msg = str(exc)
+            with lock: 
+                state["coins"][symbol]["last_signal"]["reason"] = f"Error: {err_msg}"
+                state["coins"][symbol]["last_signal"]["score"] = 0
+            runtime["last_scan_error"] = f"{symbol} Failed: {err_msg}"
+            
+    if not has_global_error:
+        runtime["last_scan_error"] = None
+        
     save_state()
     return results
 
 def trading_cycle():
+    runtime["is_scanning"] = True
     try:
         signals = scan_all_coins()
-        runtime["last_scan_error"] = None 
 
         with lock: trade = state["current_trade"]
         if trade:
@@ -511,7 +530,7 @@ def trading_cycle():
             event(f"⏳ {selected} {armed_data['side']} Signal EXPIRED. System Disarmed.")
             return
 
-        current_price = signals[selected].get("price")
+        current_price = signals.get(selected, {}).get("price")
         if not current_price: return
 
         triggered = False
@@ -521,17 +540,16 @@ def trading_cycle():
         if triggered: execute_trade(selected, state["mode"], armed_data)
 
     except Exception as exc:
-        err_str = str(exc)
-        if "HTTP 429" in err_str: err_str = "HTTP 429: Too Many Requests (Rate Limit)"
-        elif "HTTP 403" in err_str: err_str = "HTTP 403: Forbidden (IP Not Whitelisted)"
-        runtime["last_scan_error"] = err_str
+        runtime["last_scan_error"] = f"Engine Error: {str(exc)}"
+    finally:
+        runtime["is_scanning"] = False
+        runtime["last_scan"] = time.time()
 
 def engine_loop():
     event("🟢 Background Scanner Engine Started.")
     while True:
         started = time.time()
         trading_cycle()
-        runtime["last_scan"] = time.time()
         time.sleep(max(0.5, SCAN_SECONDS - (time.time() - started)))
 
 # ============================================================
@@ -543,7 +561,10 @@ def api_state():
     with lock: snapshot = json.loads(json.dumps(state))
     cmc_status = refresh_cmc_if_needed(force=False)
     snapshot["runtime"] = runtime
-    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15)
+    
+    # Engine is running if actively scanning, OR finished a scan less than 15s ago
+    snapshot["engine_running"] = runtime["is_scanning"] or bool(time.time() - runtime["last_scan"] < 15)
+    
     snapshot["cmc_connected"] = cmc_status["connected"]
     snapshot["cmc_error"] = cmc_status["error"]
     return jsonify(snapshot)
@@ -578,8 +599,11 @@ def api_coin_toggle(symbol):
             state["selected_coin"] = symbol.upper()
             state["coins"][symbol.upper()]["enabled"] = True
             state["coins"][symbol.upper()]["armed_signal"] = {
-                "side": signal["side"], "trigger_price": signal["trigger_price"],
-                "expiry_time": time.time() + (20 * 60), "atr": signal["atr"], "reason": signal["reason"]
+                "side": signal["side"],
+                "trigger_price": signal["trigger_price"],
+                "expiry_time": time.time() + (20 * 60),
+                "atr": signal["atr"],
+                "reason": signal["reason"]
             }
             event(f"🔫 {symbol.upper()} ARMED for {signal['side']}. Waiting for Price to cross {signal['trigger_price']:.2f}")
         else:
@@ -798,7 +822,7 @@ function checkAndNotify(state) {
     if (state.runtime.last_scan_error) {
         if (lastNotifiedSignals["error"] !== state.runtime.last_scan_error) {
             lastNotifiedSignals["error"] = state.runtime.last_scan_error;
-            if (Notification.permission === "granted") new Notification("⚠️ Delta Connection Error", { body: state.runtime.last_scan_error });
+            if (Notification.permission === "granted") new Notification("⚠️ Error Alert", { body: state.runtime.last_scan_error });
         }
     } else { lastNotifiedSignals["error"] = null; }
 
@@ -950,10 +974,8 @@ async function openCoin(symbol) {
     document.getElementById("modalSubtitle").innerText = "Delta product rules";
     document.getElementById("quantity").value = coin.quantity;
     
-    // Popup should open instantly, even if rules fail to load
     document.getElementById("modal").classList.add("show");
     
-    // Default load margin based on old rules or default 1
     currentModalRules = { contract_value: 1 };
     calculateMargin();
     
