@@ -21,13 +21,15 @@ STATE_FILE = "bot_state.json"
 
 API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
+CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/3.1-Pro"
+USER_AGENT = "PrimeMinisterAI/4.0-Final"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
-CANDLE_LIMIT_LTF = 160  # 5-Min timeframe limit
-CANDLE_LIMIT_HTF = 60   # 1-Hour timeframe limit
+CMC_CACHE_SECONDS = 30 * 60 
+CANDLE_LIMIT_LTF = 160  
+CANDLE_LIMIT_HTF = 60   
 
 SYMBOLS = [
     "BTCUSD",
@@ -37,13 +39,20 @@ SYMBOLS = [
     "DOGEUSD",
 ]
 
-
 # ============================================================
 # GLOBAL RUNTIME
 # ============================================================
 
 lock = threading.RLock()
+engine_thread = None
+engine_stop = threading.Event()
+
 product_cache = {}
+cmc_cache = {
+    "timestamp": 0,
+    "data": {},
+    "error": None,
+}
 
 runtime = {
     "started_at": None,
@@ -51,7 +60,6 @@ runtime = {
     "last_scan_error": None,
     "public_ip": None,
 }
-
 
 # ============================================================
 # DEFAULT STATE
@@ -108,7 +116,6 @@ def save_state():
         with open(tmp, "w", encoding="utf-8") as f: json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
 
-
 # ============================================================
 # EVENTS
 # ============================================================
@@ -120,9 +127,8 @@ def event(message):
         state["events"] = state["events"][:100]
     save_state()
 
-
 # ============================================================
-# DELTA API CORE
+# DELTA API CORE (WITH EXACT ERROR HANDLING)
 # ============================================================
 
 def delta_signature(method, timestamp, path, query_string="", body=""):
@@ -138,18 +144,26 @@ def delta_request(method, path, params=None, body=None, authenticated=False, tim
     if body is not None: headers["Content-Type"] = "application/json"
 
     if authenticated:
-        if not API_KEY or not API_SECRET: raise RuntimeError("API keys not configured")
+        if not API_KEY or not API_SECRET: raise RuntimeError("API keys missing")
         timestamp = str(int(time.time()))
         query_string = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())]) if params else ""
         signature = delta_signature(method, timestamp, path, query_string, body_text)
         headers.update({"api-key": API_KEY, "timestamp": timestamp, "signature": signature})
 
     response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
-    try: data = response.json()
-    except Exception: data = {"success": False, "error": response.text}
-
-    if response.status_code >= 400: raise RuntimeError(f"Delta HTTP {response.status_code}: {data}")
-    return data
+    
+    # EXACT ERROR PARSING
+    if response.status_code >= 400: 
+        err_msg = response.text
+        try:
+            err_json = response.json()
+            if "error" in err_json and "message" in err_json["error"]:
+                err_msg = err_json["error"]["message"]
+        except Exception: pass
+        raise RuntimeError(f"HTTP {response.status_code}: {err_msg}")
+    
+    try: return response.json()
+    except Exception: return {"success": False, "error": response.text}
 
 def get_products():
     now = time.time()
@@ -184,6 +198,7 @@ def product_rules(symbol):
     return {
         "available": True, "id": product.get("id"), "symbol": product.get("symbol"),
         "trading_status": product.get("trading_status"),
+        "contract_value": extract_number(product, ["contract_value"], 1),
         "min_quantity": extract_number(product, ["min_order_size", "minimum_order_size"]),
         "max_quantity": extract_number(product, ["max_order_size", "maximum_order_size"]),
         "quantity_step": extract_number(product, ["order_size_increment", "step_size"]),
@@ -215,6 +230,33 @@ def get_position_for_symbol(symbol):
     except Exception: pass
     return None
 
+# ============================================================
+# CMC INTEGRATION
+# ============================================================
+
+def refresh_cmc_if_needed(force=False):
+    global cmc_cache
+    if not CMC_API_KEY:
+        return {"connected": False, "cached": False, "data": {}, "error": "CMC_API_KEY missing"}
+
+    now = time.time()
+    if not force and cmc_cache["timestamp"] and now - cmc_cache["timestamp"] < CMC_CACHE_SECONDS:
+        return {"connected": True, "cached": True, "data": cmc_cache["data"], "error": cmc_cache["error"]}
+
+    try:
+        response = requests.get(
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
+            params={"symbol": ",".join(x.replace("USD", "") for x in SYMBOLS), "convert": "USD"},
+            headers={"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accepts": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json().get("data", {})
+        cmc_cache = {"timestamp": now, "data": data, "error": None}
+        return {"connected": True, "cached": False, "data": data, "error": None}
+    except Exception as exc:
+        cmc_cache["error"] = str(exc)
+        return {"connected": False, "cached": False, "data": cmc_cache["data"], "error": str(exc)}
 
 # ============================================================
 # INDICATORS & MULTI-TIMEFRAME STRATEGY
@@ -263,12 +305,10 @@ def calculate_signal(candles_5m, trend_1h):
 
     ls, ss, rl, rs = 0, 0, [], []
 
-    # 1. Trend Align
     if trend_1h == "UP": ls += 20; rl.append("1H Trend UP")
     elif trend_1h == "DOWN": ss += 20; rs.append("1H Trend DOWN")
     else: rl.append("1H Trend Flat"); rs.append("1H Trend Flat")
 
-    # 2. Momentum
     if ema9 > ema21: ls += 20; rl.append("5M EMA Bullish")
     elif ema9 < ema21: ss += 20; rs.append("5M EMA Bearish")
 
@@ -276,18 +316,15 @@ def calculate_signal(candles_5m, trend_1h):
     if mom[-1] > mom[0]: ls += 10
     elif mom[-1] < mom[0]: ss += 10
 
-    # 3. RSI
     if 52 <= rsi_val <= 68: ls += 15
     if 32 <= rsi_val <= 48: ss += 15
     if rsi_val > 75: ls -= 10
     if rsi_val < 25: ss -= 10
 
-    # 4. Breakout Levels
     ph, pl = max(x["high"] for x in candles_5m[-21:-1]), min(x["low"] for x in candles_5m[-21:-1])
     if price > ph: ls += 15; rl.append("5M Breakout")
     if price < pl: ss += 15; rs.append("5M Breakdown")
 
-    # 5. Volume Confirmation
     rv = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
     bv = sum(volumes[-25:-5]) / 20 if len(volumes) >= 25 else 0
     if bv > 0 and (rv / bv) >= 1.2:
@@ -306,9 +343,8 @@ def calculate_signal(candles_5m, trend_1h):
     reason = f"Wait: Trend Conflict" if (ls>75 and trend_1h=="DOWN") or (ss>75 and trend_1h=="UP") else "No Clear Edge"
     return {"side": "NO_TRADE", "score": score, "price": price, "trigger_price": None, "reason": reason, "atr": atr_val, "updated_at": datetime.now(timezone.utc).isoformat()}
 
-
 # ============================================================
-# BULLETPROOF IP TRACKER
+# IP TRACKER
 # ============================================================
 
 def get_public_ip():
@@ -335,7 +371,6 @@ def validate_coin_settings(symbol, quantity, leverage):
     except: return False, "Must be numeric"
     if quantity <= 0 or leverage <= 0: return False, "Must be > 0"
     return True, "OK"
-
 
 # ============================================================
 # SMART EXECUTION (ARMED & TRAILING)
@@ -408,18 +443,21 @@ def close_trade(price, reason):
     if not trade: return False
 
     if trade["mode"] == "LIVE":
-        pos = get_position_for_symbol(trade["symbol"])
-        if pos and float(pos.get("size", 0)) > 0:
-            delta_request("POST", "/v2/orders", body={"product_symbol": trade["symbol"], "size": abs(float(pos["size"])), "side": "sell" if str(pos.get("side", "")).lower() == "buy" else "buy", "order_type": "market_order", "reduce_only": True}, authenticated=True)
-    
+        try:
+            pos = get_position_for_symbol(trade["symbol"])
+            if pos and float(pos.get("size", 0)) > 0:
+                delta_request("POST", "/v2/orders", body={"product_symbol": trade["symbol"], "size": abs(float(pos["size"])), "side": "sell" if str(pos.get("side", "")).lower() == "buy" else "buy", "order_type": "market_order", "reduce_only": True}, authenticated=True)
+        except Exception as e:
+            event(f"❌ Failed to close LIVE trade: {e}")
+            return False
+            
     event(f"🔒 {trade['mode']} trade closed: {trade['symbol']} @ {price} ({reason})")
     with lock: state["current_trade"] = None
     save_state()
     return True
 
-
 # ============================================================
-# MASTER SCANNER (ALWAYS RUNNING)
+# MASTER SCANNER
 # ============================================================
 
 def scan_all_coins():
@@ -438,15 +476,15 @@ def scan_all_coins():
             
             with lock: state["coins"][symbol]["last_signal"] = signal
             results[symbol] = signal
+            time.sleep(0.2) # Rate Limit Protection Delay
         except Exception as exc:
             with lock: state["coins"][symbol]["last_signal"] = {"side": "NO_TRADE", "score": 0, "price": None, "reason": f"Scan Error"}
-            raise exc # Pass to outer loop for event logging
+            raise exc 
     save_state()
     return results
 
 def trading_cycle():
     try:
-        # SCANNING ALWAYS HAPPENS - Regardless of System ON/OFF
         signals = scan_all_coins()
         runtime["last_scan_error"] = None 
 
@@ -455,7 +493,6 @@ def trading_cycle():
             manage_active_trade()
             return
 
-        # EXECUTION ONLY HAPPENS IF SYSTEM IS ON AND COIN IS ARMED
         with lock: system_on, selected = bool(state["system_on"]), state["selected_coin"]
         if not system_on or selected not in SYMBOLS: return
         
@@ -471,7 +508,7 @@ def trading_cycle():
                 state["coins"][selected]["armed_signal"] = None
                 if state["selected_coin"] == selected: state["selected_coin"] = None
             save_state()
-            event(f"⏳ {selected} {armed_data['side']} Signal EXPIRED. Momentum Lost. System Disarmed.")
+            event(f"⏳ {selected} {armed_data['side']} Signal EXPIRED. System Disarmed.")
             return
 
         current_price = signals[selected].get("price")
@@ -481,20 +518,21 @@ def trading_cycle():
         if armed_data["side"] == "LONG" and current_price >= armed_data["trigger_price"]: triggered = True
         elif armed_data["side"] == "SHORT" and current_price <= armed_data["trigger_price"]: triggered = True
 
-        if triggered:
-            execute_trade(selected, state["mode"], armed_data)
+        if triggered: execute_trade(selected, state["mode"], armed_data)
 
     except Exception as exc:
-        runtime["last_scan_error"] = str(exc)
+        err_str = str(exc)
+        if "HTTP 429" in err_str: err_str = "HTTP 429: Too Many Requests (Rate Limit)"
+        elif "HTTP 403" in err_str: err_str = "HTTP 403: Forbidden (IP Not Whitelisted)"
+        runtime["last_scan_error"] = err_str
 
 def engine_loop():
-    event("🟢 Background Scanner Engine Started. Fetching Market Data...")
+    event("🟢 Background Scanner Engine Started.")
     while True:
         started = time.time()
         trading_cycle()
         runtime["last_scan"] = time.time()
         time.sleep(max(0.5, SCAN_SECONDS - (time.time() - started)))
-
 
 # ============================================================
 # API ENDPOINTS
@@ -503,13 +541,18 @@ def engine_loop():
 @app.get("/api/state")
 def api_state():
     with lock: snapshot = json.loads(json.dumps(state))
+    cmc_status = refresh_cmc_if_needed(force=False)
     snapshot["runtime"] = runtime
-    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15) # True if scanned in last 15s
+    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15)
+    snapshot["cmc_connected"] = cmc_status["connected"]
+    snapshot["cmc_error"] = cmc_status["error"]
     return jsonify(snapshot)
 
 @app.get("/api/coin/<symbol>/rules")
 def api_coin_rules(symbol):
-    return jsonify({"success": True, "rules": product_rules(symbol.upper())})
+    rules = product_rules(symbol.upper())
+    if not rules.get("available"): return jsonify({"success": False, "error": rules.get("message")}), 400
+    return jsonify({"success": True, "rules": rules})
 
 @app.post("/api/coin/<symbol>/settings")
 def api_coin_settings(symbol):
@@ -531,16 +574,12 @@ def api_coin_toggle(symbol):
             signal = state["coins"][symbol.upper()]["last_signal"]
             if signal["side"] == "NO_TRADE":
                 return jsonify({"success": False, "error": "Cannot Arm: No valid signal right now."}), 400
-            
             for other in SYMBOLS: state["coins"][other]["enabled"] = (other == symbol.upper())
             state["selected_coin"] = symbol.upper()
             state["coins"][symbol.upper()]["enabled"] = True
             state["coins"][symbol.upper()]["armed_signal"] = {
-                "side": signal["side"],
-                "trigger_price": signal["trigger_price"],
-                "expiry_time": time.time() + (20 * 60),
-                "atr": signal["atr"],
-                "reason": signal["reason"]
+                "side": signal["side"], "trigger_price": signal["trigger_price"],
+                "expiry_time": time.time() + (20 * 60), "atr": signal["atr"], "reason": signal["reason"]
             }
             event(f"🔫 {symbol.upper()} ARMED for {signal['side']}. Waiting for Price to cross {signal['trigger_price']:.2f}")
         else:
@@ -556,7 +595,7 @@ def api_system():
     enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
     with lock: state["system_on"] = enabled
     save_state()
-    if enabled: event("⚡ SYSTEM ON: Execution Engine Active (Will fire if Armed Coin triggers)")
+    if enabled: event("⚡ SYSTEM ON: Execution Engine Active")
     else: event("⏸️ SYSTEM OFF: Execution Engine Paused")
     return jsonify({"success": True})
 
@@ -576,10 +615,10 @@ def api_close_trade():
     try:
         candles = get_candles(trade["symbol"], "5m", 10)
         price = candles[-1]["close"] if candles else trade.get("entry")
-        close_trade(price, "Manual close")
+        ok = close_trade(price, "Manual close")
+        if not ok: return jsonify({"success": False, "error": "Failed to close trade. Check Event Log."}), 500
         return jsonify({"success": True})
     except Exception as exc: return jsonify({"success": False, "error": str(exc)}), 500
-
 
 # ============================================================
 # DASHBOARD / HTML FRONTEND 
@@ -641,6 +680,7 @@ button:hover { background: #172b43; }
 .rule { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid #18273a; font-size: 12px; }
 .rule span:first-child { color: #8497ac; }
 .small { color: #71849a; font-size: 11px; }
+.margin-calc { background: #16263a; padding: 10px; border-radius: 8px; margin-top: 15px; font-size: 14px; font-weight: bold; text-align: center; color: #ffc857; }
 </style>
 </head>
 <body>
@@ -706,8 +746,9 @@ button:hover { background: #172b43; }
             <button onclick="closeModal()">X</button>
         </div>
         <div id="rules" style="margin-top:14px"></div>
-        <div class="form-row"><label>Quantity</label><input id="quantity" type="number" step="any" /></div>
-        <div class="form-row"><label>Leverage</label><select id="leverage"></select></div>
+        <div class="form-row"><label>Quantity</label><input id="quantity" type="number" step="any" oninput="calculateMargin()" /></div>
+        <div class="form-row"><label>Leverage</label><select id="leverage" onchange="calculateMargin()"></select></div>
+        <div id="marginDisplay" class="margin-calc">Estimated Margin Required: -- USD</div>
         <div class="controls" style="margin-top:16px">
             <button onclick="saveSettings()">SAVE SETTINGS</button>
             <button onclick="toggleSelectedCoin()">ARM / DISARM</button>
@@ -718,6 +759,7 @@ button:hover { background: #172b43; }
 <script>
 let appState = null;
 let selectedModalCoin = null;
+let currentModalRules = null;
 let lastNotifiedSignals = { error: null };
 
 if (Notification.permission !== "granted" && Notification.permission !== "denied") {
@@ -737,11 +779,26 @@ function signalClass(side) {
     return "gray";
 }
 
+function calculateMargin() {
+    if(!appState || !selectedModalCoin || !currentModalRules) return;
+    const qty = Number(document.getElementById("quantity").value);
+    const lev = Number(document.getElementById("leverage").value);
+    const price = appState.coins[selectedModalCoin].last_signal.price;
+    const cv = currentModalRules.contract_value || 1;
+    
+    if(qty > 0 && lev > 0 && price > 0) {
+        const margin = (qty * cv * price) / lev;
+        document.getElementById("marginDisplay").innerText = `Estimated Margin Required: $${margin.toFixed(2)}`;
+    } else {
+        document.getElementById("marginDisplay").innerText = `Estimated Margin Required: -- USD`;
+    }
+}
+
 function checkAndNotify(state) {
     if (state.runtime.last_scan_error) {
         if (lastNotifiedSignals["error"] !== state.runtime.last_scan_error) {
             lastNotifiedSignals["error"] = state.runtime.last_scan_error;
-            if (Notification.permission === "granted") new Notification("⚠️ Delta Error", { body: state.runtime.last_scan_error });
+            if (Notification.permission === "granted") new Notification("⚠️ Delta Connection Error", { body: state.runtime.last_scan_error });
         }
     } else { lastNotifiedSignals["error"] = null; }
 
@@ -752,7 +809,7 @@ function checkAndNotify(state) {
             if (lastNotifiedSignals[symbol] !== signal.side) {
                 lastNotifiedSignals[symbol] = signal.side;
                 if (Notification.permission === "granted") {
-                    new Notification(`🚀 Setup Ready: ${symbol}`, { body: `HTF Trend Matched! Target Breakout Price: ${signal.trigger_price.toFixed(2)}` });
+                    new Notification(`🚀 Setup Ready: ${symbol}`, { body: `Target Breakout Price: ${signal.trigger_price.toFixed(2)}` });
                 }
             }
         } else { lastNotifiedSignals[symbol] = null; }
@@ -771,7 +828,9 @@ function render(state) {
     document.getElementById("selected").innerText = state.selected_coin || "None";
     
     document.getElementById("connections").innerHTML = `
-        <div class="rule"><span>Delta API Connection</span><span class="${state.runtime.last_scan_error ? 'red' : 'green'}">${state.runtime.last_scan_error ? 'ERROR' : 'CONNECTED & READY'}</span></div>
+        <div class="rule"><span>Delta API Status</span><span class="${state.runtime.last_scan_error ? 'red' : 'green'}">${state.runtime.last_scan_error ? 'CONNECTION ERROR' : 'CONNECTED & READY'}</span></div>
+        <div class="rule"><span>Delta Error Detail</span><span class="${state.runtime.last_scan_error ? 'red' : 'gray'}">${state.runtime.last_scan_error ? state.runtime.last_scan_error : 'None'}</span></div>
+        <div class="rule"><span>CoinMarketCap API</span><span class="${state.cmc_connected ? 'green' : 'red'}">${state.cmc_connected ? 'CONNECTED' : (state.cmc_error ? state.cmc_error : 'NOT CONNECTED')}</span></div>
         <div class="rule"><span>Background Scanner</span><span class="${state.engine_running ? 'green' : 'red'}">${state.engine_running ? 'SCANNING LIVE' : 'STOPPED/LOADING'}</span></div>
     `;
 
@@ -847,7 +906,7 @@ function renderEvents(state) {
     for (const item of (state.events || [])) {
         const div = document.createElement("div");
         div.className = "event-item";
-        if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed")) div.style.color = "#ff6577";
+        if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed") || item.message.includes("HTTP")) div.style.color = "#ff6577";
         else if (item.message.includes("Trailing Stop")) div.style.color = "#ffc857";
         else if (item.message.includes("EXECUTED") || item.message.includes("ARMED") || item.message.includes("Started")) div.style.color = "#45e09b";
         else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED") || item.message.includes("Paused")) div.style.color = "#8294aa";
@@ -890,28 +949,41 @@ async function openCoin(symbol) {
     document.getElementById("modalTitle").innerText = symbol;
     document.getElementById("modalSubtitle").innerText = "Delta product rules";
     document.getElementById("quantity").value = coin.quantity;
-    await loadRules(symbol);
+    
+    // Popup should open instantly, even if rules fail to load
     document.getElementById("modal").classList.add("show");
+    
+    // Default load margin based on old rules or default 1
+    currentModalRules = { contract_value: 1 };
+    calculateMargin();
+    
+    await loadRules(symbol);
 }
 
 async function loadRules(symbol) {
     try {
         const res = await fetch(`/api/coin/${symbol}/rules`, {cache: "no-store"});
         const data = await res.json();
-        if (!data.success) { alert(data.error); return; }
+        if (!data.success) { 
+            document.getElementById("rules").innerHTML = `<div class="red">${data.error}</div>`; 
+            return; 
+        }
+        currentModalRules = data.rules;
         renderRules(data.rules);
-    } catch (e) { alert("Failed to load Delta rules"); }
+        calculateMargin();
+    } catch (e) { 
+        document.getElementById("rules").innerHTML = `<div class="red">Failed to load Delta rules</div>`;
+    }
 }
 
 function renderRules(rules) {
     const box = document.getElementById("rules");
-    if (!rules.available) { box.innerHTML = `<div class="red">${rules.message || "Delta rules unavailable"}</div>`; return; }
-    
     const maxRaw = rules.max_leverage ?? rules.default_leverage ?? 100;
     const max = Number.isFinite(Number(maxRaw)) ? Number(maxRaw) : 100;
     const min = Number.isFinite(Number(rules.min_leverage)) ? Number(rules.min_leverage) : 1;
 
     box.innerHTML = `
+        <div class="rule"><span>Contract Value</span><span>${rules.contract_value ?? "--"}</span></div>
         <div class="rule"><span>Min qty</span><span>${rules.min_quantity ?? "--"}</span></div>
         <div class="rule"><span>Max qty</span><span>${rules.max_quantity ?? "--"}</span></div>
         <div class="rule"><span>Step</span><span>${rules.quantity_step ?? "--"}</span></div>
