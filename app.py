@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request, render_template_string
 
 
 # ============================================================
-# PRIME MINISTER AI — PROFESSIONAL INTRADAY COMMANDER
+# PRIME MINISTER AI — INTRADAY COMMANDER
 # ============================================================
 
 app = Flask(__name__)
@@ -33,7 +33,7 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
 
-USER_AGENT = "PrimeMinisterAI/9.0-Ultimate"
+USER_AGENT = "PrimeMinisterAI/Final-Stable"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -272,12 +272,12 @@ def get_position_for_symbol(symbol):
     try:
         res = delta_request("GET", "/v2/positions", authenticated=True)
         if not isinstance(res, dict) or "result" not in res:
-            return None # None represents API Error / Network Failure
+            return None # Error
             
         for pos in res.get("result", []):
             if str(pos.get("product_symbol") or pos.get("symbol") or "").upper() == symbol.upper():
                 if abs(float(pos.get("size", 0) or 0)) > 0: return pos
-        return "NO_POSITION" # String represents explicit successful confirmation of 0 position
+        return "NO_POSITION" 
     except Exception: 
         return None # Error
 
@@ -414,7 +414,7 @@ def ip_updater_loop():
         time.sleep(60)
 
 # ============================================================
-# EXECUTION CORE (HARD STOP LOSS + STATELESS CHECKS)
+# EXECUTION CORE
 # ============================================================
 
 def execute_trade(symbol, mode, armed_data):
@@ -425,7 +425,6 @@ def execute_trade(symbol, mode, armed_data):
         raw_qty = float(coin["quantity"])
         lev = float(coin["leverage"])
         
-        # 1. STRICT ROUNDING
         step_size = float(rules.get("quantity_step", 1))
         qty = max(step_size, round(raw_qty / step_size) * step_size)
 
@@ -433,7 +432,6 @@ def execute_trade(symbol, mode, armed_data):
         entry_price = armed_data["trigger_price"]
         atr_val = armed_data["atr"]
         
-        # 2. HARD STOP LOSS CALCULATION
         stop_price = entry_price - (atr_val * 1.5) if side == "LONG" else entry_price + (atr_val * 1.5)
         stop_price = round(stop_price, 2)
 
@@ -447,13 +445,11 @@ def execute_trade(symbol, mode, armed_data):
                 
             set_delta_leverage(symbol, lev)
             
-            # FIRE ENTRY ORDER (Market)
             entry_payload = {
                 "product_symbol": symbol, "size": qty, "side": ("buy" if side == "LONG" else "sell"), "order_type": "market_order"
             }
             res_entry = delta_request("POST", "/v2/orders", body=entry_payload, authenticated=True)
             
-            # FIRE HARD STOP-LOSS ORDER (Exchange Level)
             sl_payload = {
                 "product_symbol": symbol, "size": qty, "side": ("sell" if side == "LONG" else "buy"),
                 "order_type": "stop_order", "stop_price": str(stop_price), "reduce_only": True
@@ -488,18 +484,15 @@ def manage_active_trade():
     symbol = trade["symbol"]
     
     try:
-        # STATELESS CHECK: Make sure the trade actually exists on Delta
         if trade["mode"] == "LIVE":
             pos = get_position_for_symbol(symbol)
             if pos == "NO_POSITION":
-                # Position explicitly confirmed closed on exchange
                 cancel_specific_order(symbol, trade.get("sl_order_id")) 
                 with lock: state["current_trade"] = None
                 save_state()
                 event(f"🔒 {symbol} Trade closed on exchange (Stop Loss or Manual). System updated.")
                 return
             elif pos is None:
-                # API Network Error - Do not kill trade state, just wait for next cycle
                 return
 
         candles = get_candles(symbol, "5m", 10)
@@ -514,7 +507,6 @@ def manage_active_trade():
                     new_stop = round(trade["highest_price"] - (atr_val * 1.5), 2)
                     
                     if trade["stop"] is None or new_stop > trade["stop"]:
-                        # UPDATE HARD SL ON EXCHANGE
                         if trade["mode"] == "LIVE":
                             cancel_specific_order(symbol, trade.get("sl_order_id"))
                             res_sl = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(new_stop), "reduce_only": True}, authenticated=True)
@@ -530,7 +522,6 @@ def manage_active_trade():
                     new_stop = round(trade["lowest_price"] + (atr_val * 1.5), 2)
                     
                     if trade["stop"] is None or new_stop < trade["stop"]:
-                        # UPDATE HARD SL ON EXCHANGE
                         if trade["mode"] == "LIVE":
                             cancel_specific_order(symbol, trade.get("sl_order_id"))
                             res_sl = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(new_stop), "reduce_only": True}, authenticated=True)
@@ -562,7 +553,7 @@ def close_trade(price, reason):
     return True
 
 # ============================================================
-# MASTER SCANNER (RATE LIMITED)
+# MASTER SCANNER 
 # ============================================================
 
 def scan_all_coins():
@@ -592,7 +583,6 @@ def scan_all_coins():
             elif signal["side"] == "NO_TRADE":
                 backend_notified_signals[symbol] = None
             
-            # STRICT RATE LIMITING (1 Sec per coin)
             time.sleep(1) 
             
         except Exception as exc:
@@ -602,7 +592,7 @@ def scan_all_coins():
                 state["coins"][symbol]["last_signal"]["reason"] = f"Error: {err_msg}"
                 state["coins"][symbol]["last_signal"]["score"] = 0
             runtime["last_scan_error"] = f"{symbol} Failed: {err_msg}"
-            time.sleep(1) # Sleep even on error to cool down
+            time.sleep(1)
             
     if not has_global_error:
         runtime["last_scan_error"] = None
@@ -654,7 +644,7 @@ def trading_cycle():
         runtime["last_scan"] = time.time()
 
 def engine_loop():
-    event("🟢 Engine Started. Hard-SL & Stateless Architecture Active.")
+    event("🟢 Engine Started. Monitoring markets...")
     while True:
         started = time.time()
         trading_cycle()
@@ -675,7 +665,12 @@ def ensure_background_threads():
 # API ENDPOINTS
 # ============================================================
 
-@app.get("/api/state")
+# YAHAN MAIN WAPAS LAGA DIYA HAI MAIN PAGE ROUTE (404 ERROR FIX)
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/state", methods=["GET"])
 def api_state():
     ensure_background_threads() 
     
@@ -687,13 +682,13 @@ def api_state():
     snapshot["cmc_error"] = cmc_status["error"]
     return jsonify(snapshot)
 
-@app.get("/api/coin/<symbol>/rules")
+@app.route("/api/coin/<symbol>/rules", methods=["GET"])
 def api_coin_rules(symbol):
     rules = product_rules(symbol.upper())
     if not rules.get("available"): return jsonify({"success": False, "error": rules.get("message")}), 400
     return jsonify({"success": True, "rules": rules})
 
-@app.post("/api/coin/<symbol>/settings")
+@app.route("/api/coin/<symbol>/settings", methods=["POST"])
 def api_coin_settings(symbol):
     data = request.get_json(silent=True) or {}
     quantity, leverage = float(data.get("quantity", 1)), float(data.get("leverage", 1))
@@ -703,7 +698,7 @@ def api_coin_settings(symbol):
     save_state()
     return jsonify({"success": True})
 
-@app.post("/api/coin/<symbol>/toggle")
+@app.route("/api/coin/<symbol>/toggle", methods=["POST"])
 def api_coin_toggle(symbol):
     enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
     with lock:
@@ -730,7 +725,7 @@ def api_coin_toggle(symbol):
     save_state()
     return jsonify({"success": True})
 
-@app.post("/api/system")
+@app.route("/api/system", methods=["POST"])
 def api_system():
     enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
     
@@ -743,7 +738,7 @@ def api_system():
     else: event("⏸️ SYSTEM OFF: Execution Engine Paused")
     return jsonify({"success": True})
 
-@app.post("/api/mode")
+@app.route("/api/mode", methods=["POST"])
 def api_mode():
     mode = str((request.get_json(silent=True) or {}).get("mode", "")).upper()
     with lock:
@@ -752,7 +747,7 @@ def api_mode():
     save_state()
     return jsonify({"success": True})
 
-@app.post("/api/trade/close")
+@app.route("/api/trade/close", methods=["POST"])
 def api_close_trade():
     with lock: trade = state["current_trade"]
     if not trade: return jsonify({"success": False, "error": "No open trade"}), 400
@@ -1199,11 +1194,6 @@ setInterval(loadState, 5000);
 </body>
 </html>
 """
-
-def startup():
-    ensure_background_threads()
-
-startup()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
