@@ -33,7 +33,7 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
 
-USER_AGENT = "PrimeMinisterAI/8.0-Master"
+USER_AGENT = "PrimeMinisterAI/9.0-Ultimate"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -153,7 +153,7 @@ def send_email_alert(symbol, side, trigger_price):
             server.send_message(msg)
             event(f"📧 Email Alert Sent for {symbol}")
     except Exception:
-        pass # Silently fail if email is wrong, don't crash engine
+        pass 
 
 # ============================================================
 # DELTA API CORE
@@ -270,21 +270,21 @@ def get_candles(symbol, resolution="5m", limit=160):
 
 def get_position_for_symbol(symbol):
     try:
-        for pos in delta_request("GET", "/v2/positions", authenticated=True).get("result", []):
+        res = delta_request("GET", "/v2/positions", authenticated=True)
+        if not isinstance(res, dict) or "result" not in res:
+            return None # None represents API Error / Network Failure
+            
+        for pos in res.get("result", []):
             if str(pos.get("product_symbol") or pos.get("symbol") or "").upper() == symbol.upper():
                 if abs(float(pos.get("size", 0) or 0)) > 0: return pos
-    except Exception: pass
-    return None
+        return "NO_POSITION" # String represents explicit successful confirmation of 0 position
+    except Exception: 
+        return None # Error
 
-def get_open_orders(symbol):
+def cancel_specific_order(symbol, order_id):
+    if not order_id: return
     try:
-        orders = delta_request("GET", "/v2/orders", params={"state": "open"}, authenticated=True).get("result", [])
-        return [o for o in orders if str(o.get("product_symbol") or o.get("symbol") or "").upper() == symbol.upper()]
-    except Exception: return []
-
-def cancel_all_orders(symbol):
-    try:
-        delta_request("DELETE", "/v2/orders", params={"product_symbol": symbol}, authenticated=True)
+        delta_request("DELETE", "/v2/orders", body={"id": order_id, "product_symbol": symbol}, authenticated=True)
     except Exception: pass
 
 # ============================================================
@@ -435,13 +435,13 @@ def execute_trade(symbol, mode, armed_data):
         
         # 2. HARD STOP LOSS CALCULATION
         stop_price = entry_price - (atr_val * 1.5) if side == "LONG" else entry_price + (atr_val * 1.5)
-        
-        # Ensure stop price meets tick size if needed (Delta usually handles rounding, but good practice)
         stop_price = round(stop_price, 2)
 
+        sl_order_id = None
+
         if mode == "LIVE":
-            # Check for existing position to avoid double entry
-            if get_position_for_symbol(symbol): 
+            pos = get_position_for_symbol(symbol)
+            if pos != "NO_POSITION" and pos is not None: 
                 event(f"⚠️ Entry Skipped: Open position already exists for {symbol}.")
                 return False
                 
@@ -460,6 +460,7 @@ def execute_trade(symbol, mode, armed_data):
             }
             res_sl = delta_request("POST", "/v2/orders", body=sl_payload, authenticated=True)
             
+            sl_order_id = res_sl.get("result", {}).get("id") if isinstance(res_sl, dict) else None
             result = f"Entry: {res_entry.get('success', False)} | SL: {res_sl.get('success', False)}"
         else:
             result = "PAPER_SIMULATION_WITH_HARD_SL"
@@ -468,6 +469,7 @@ def execute_trade(symbol, mode, armed_data):
             state["current_trade"] = {
                 "symbol": symbol, "side": side, "entry": entry_price, "quantity": qty,
                 "leverage": lev, "stop": stop_price, "entry_atr": atr_val,
+                "sl_order_id": sl_order_id,
                 "highest_price": entry_price, "lowest_price": entry_price, "mode": mode,
                 "exchange_order": result, "opened_at": datetime.now(timezone.utc).isoformat(), "reason": armed_data["reason"],
             }
@@ -489,12 +491,15 @@ def manage_active_trade():
         # STATELESS CHECK: Make sure the trade actually exists on Delta
         if trade["mode"] == "LIVE":
             pos = get_position_for_symbol(symbol)
-            if not pos:
-                # Position is gone (hit SL or closed manually on app). Clean up state.
-                cancel_all_orders(symbol) # Clear pending SL orders
+            if pos == "NO_POSITION":
+                # Position explicitly confirmed closed on exchange
+                cancel_specific_order(symbol, trade.get("sl_order_id")) 
                 with lock: state["current_trade"] = None
                 save_state()
                 event(f"🔒 {symbol} Trade closed on exchange (Stop Loss or Manual). System updated.")
+                return
+            elif pos is None:
+                # API Network Error - Do not kill trade state, just wait for next cycle
                 return
 
         candles = get_candles(symbol, "5m", 10)
@@ -506,31 +511,33 @@ def manage_active_trade():
                 if "highest_price" not in trade: trade["highest_price"] = trade["entry"]
                 if price > trade["highest_price"]:
                     trade["highest_price"] = price
-                    new_stop = trade["highest_price"] - (atr_val * 1.5)
+                    new_stop = round(trade["highest_price"] - (atr_val * 1.5), 2)
                     
                     if trade["stop"] is None or new_stop > trade["stop"]:
-                        trade["stop"] = round(new_stop, 2)
-                        event(f"📈 Trailing Stop (L) Moved UP to: {trade['stop']:.2f}")
-                        
                         # UPDATE HARD SL ON EXCHANGE
                         if trade["mode"] == "LIVE":
-                            cancel_all_orders(symbol)
-                            delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(trade["stop"]), "reduce_only": True}, authenticated=True)
+                            cancel_specific_order(symbol, trade.get("sl_order_id"))
+                            res_sl = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(new_stop), "reduce_only": True}, authenticated=True)
+                            trade["sl_order_id"] = res_sl.get("result", {}).get("id") if isinstance(res_sl, dict) else None
+                        
+                        trade["stop"] = new_stop
+                        event(f"📈 Trailing Stop (L) Moved UP to: {trade['stop']:.2f}")
 
             elif side == "SHORT":
                 if "lowest_price" not in trade: trade["lowest_price"] = trade["entry"]
                 if price < trade["lowest_price"]:
                     trade["lowest_price"] = price
-                    new_stop = trade["lowest_price"] + (atr_val * 1.5)
+                    new_stop = round(trade["lowest_price"] + (atr_val * 1.5), 2)
                     
                     if trade["stop"] is None or new_stop < trade["stop"]:
-                        trade["stop"] = round(new_stop, 2)
-                        event(f"📉 Trailing Stop (S) Moved DOWN to: {trade['stop']:.2f}")
-                        
                         # UPDATE HARD SL ON EXCHANGE
                         if trade["mode"] == "LIVE":
-                            cancel_all_orders(symbol)
-                            delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(trade["stop"]), "reduce_only": True}, authenticated=True)
+                            cancel_specific_order(symbol, trade.get("sl_order_id"))
+                            res_sl = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(new_stop), "reduce_only": True}, authenticated=True)
+                            trade["sl_order_id"] = res_sl.get("result", {}).get("id") if isinstance(res_sl, dict) else None
+                            
+                        trade["stop"] = new_stop
+                        event(f"📉 Trailing Stop (S) Moved DOWN to: {trade['stop']:.2f}")
         save_state()
     except Exception as exc: 
         event(f"Trade management error: {exc}")
@@ -541,9 +548,9 @@ def close_trade(price, reason):
 
     if trade["mode"] == "LIVE":
         try:
-            cancel_all_orders(trade["symbol"]) # Kill pending SL
+            cancel_specific_order(trade["symbol"], trade.get("sl_order_id")) 
             pos = get_position_for_symbol(trade["symbol"])
-            if pos and float(pos.get("size", 0)) > 0:
+            if pos and pos != "NO_POSITION" and float(pos.get("size", 0)) > 0:
                 delta_request("POST", "/v2/orders", body={"product_symbol": trade["symbol"], "size": abs(float(pos["size"])), "side": "sell" if str(pos.get("side", "")).lower() == "buy" else "buy", "order_type": "market_order", "reduce_only": True}, authenticated=True)
         except Exception as e:
             event(f"❌ Failed to close LIVE trade: {e}")
@@ -824,7 +831,7 @@ button:hover { background: #172b43; }
 
 <header>
     <h1>Prime Minister AI (Pro Sniper)</h1>
-    <div class="subtitle">Stateless Engine | Hard Stop-Loss | Email Alerts</div>
+    <div class="subtitle">Stateless Engine | Hard Stop-Loss | Network Safe</div>
 </header>
 
 <div class="container">
@@ -1052,7 +1059,7 @@ function renderTrade(state) {
             <div><div class="label">SYMBOL</div><div class="value">${trade.symbol}</div></div>
             <div><div class="label">SIDE</div><div class="value ${signalClass(trade.side)}">${trade.side}</div></div>
             <div><div class="label">ENTRY</div><div class="value">${money(trade.entry)}</div></div>
-            <div><div class="label">HARD STOP LOSS (Exch)</div><div class="value yellow">${money(trade.stop)}</div></div>
+            <div><div class="label">HARD STOP LOSS</div><div class="value yellow">${money(trade.stop)}</div></div>
             <div><div class="label">QTY (LOTS)</div><div class="value">${trade.quantity}</div></div>
             <div><div class="label">LEVERAGE</div><div class="value">${trade.leverage}x</div></div>
         </div>
@@ -1068,7 +1075,7 @@ function renderEvents(state) {
         if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed") || item.message.toLowerCase().includes("cannot") || item.message.includes("HTTP") || item.message.includes("Timeout")) div.style.color = "#ff6577";
         else if (item.message.includes("Trailing Stop") || item.message.includes("Placed")) div.style.color = "#ffc857";
         else if (item.message.includes("EXECUTED") || item.message.includes("ARMED") || item.message.includes("Started")) div.style.color = "#45e09b";
-        else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED") || item.message.includes("Paused")) div.style.color = "#8294aa";
+        else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED") || item.message.includes("Paused") || item.message.includes("closed")) div.style.color = "#8294aa";
         else if (item.message.includes("Email")) div.style.color = "#42a5f5";
         
         div.innerText = `${item.time.split('T')[1].slice(0,8)} — ${item.message}`;
@@ -1193,9 +1200,10 @@ setInterval(loadState, 5000);
 </html>
 """
 
-@app.get("/")
-def index():
-    return render_template_string(HTML)
+def startup():
+    ensure_background_threads()
+
+startup()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
