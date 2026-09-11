@@ -4,6 +4,8 @@ import time
 import hmac
 import hashlib
 import threading
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
 import requests
@@ -19,11 +21,19 @@ app = Flask(__name__)
 DELTA_BASE = "https://api.india.delta.exchange"
 STATE_FILE = "bot_state.json"
 
+# API KEYS
 API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
 
-USER_AGENT = "PrimeMinisterAI/4.1-Final"
+# EMAIL NOTIFICATION SETTINGS
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
+
+USER_AGENT = "PrimeMinisterAI/5.0-Final"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 60
@@ -40,7 +50,7 @@ SYMBOLS = [
 ]
 
 # ============================================================
-# GLOBAL RUNTIME
+# GLOBAL RUNTIME & TRACKING
 # ============================================================
 
 lock = threading.RLock()
@@ -59,7 +69,11 @@ runtime = {
     "last_scan": 0,
     "last_scan_error": None,
     "public_ip": None,
+    "is_scanning": False
 }
+
+# Tracking emails sent to avoid spamming
+backend_notified_signals = {symbol: None for symbol in SYMBOLS}
 
 # ============================================================
 # DEFAULT STATE
@@ -128,6 +142,31 @@ def event(message):
     save_state()
 
 # ============================================================
+# EMAIL SENDER CORE
+# ============================================================
+
+def send_email_alert(symbol, side, trigger_price):
+    if not EMAIL_SENDER or not EMAIL_PASSWORD:
+        return # Skip if email not configured
+    
+    subject = f"🚀 {symbol} {side} Setup Ready!"
+    body = f"Prime Minister AI - Professional Alert\n\nCoin: {symbol}\nSetup: {side} (Score 75+)\nTarget Breakout Trigger: {trigger_price:.2f}\n\nHTF Trend matches LTF Momentum. Please open your dashboard to ARM the coin if you want to trade this setup."
+    
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = "Prime Minister AI"
+    msg['To'] = EMAIL_RECEIVER
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+            event(f"📧 Email Alert Sent for {symbol} {side} Setup")
+    except Exception as e:
+        event(f"❌ Email Alert Failed: Check App Password / Config")
+
+# ============================================================
 # DELTA API CORE
 # ============================================================
 
@@ -135,7 +174,7 @@ def delta_signature(method, timestamp, path, query_string="", body=""):
     message = method.upper() + str(timestamp) + path + query_string + body
     return hmac.new(API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def delta_request(method, path, params=None, body=None, authenticated=False, timeout=10):
+def delta_request(method, path, params=None, body=None, authenticated=False, timeout=3):
     url = DELTA_BASE + path
     params = params or {}
     body_text = "" if body is None else json.dumps(body, separators=(",", ":"))
@@ -150,8 +189,15 @@ def delta_request(method, path, params=None, body=None, authenticated=False, tim
         signature = delta_signature(method, timestamp, path, query_string, body_text)
         headers.update({"api-key": API_KEY, "timestamp": timestamp, "signature": signature})
 
-    response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
-    
+    try:
+        response = requests.request(method=method.upper(), url=url, params=params, data=body_text if body is not None else None, headers=headers, timeout=timeout)
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Timeout: Delta Server Slow/Unresponsive")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Connection Error: DNS or Blocked")
+    except Exception as e:
+        raise RuntimeError(f"Request Failed: {str(e)}")
+
     if response.status_code >= 400: 
         err_msg = response.text
         try:
@@ -159,7 +205,6 @@ def delta_request(method, path, params=None, body=None, authenticated=False, tim
             if "error" in err_json and "message" in err_json["error"]:
                 err_msg = err_json["error"]["message"]
             elif "error" in err_json and "context" in err_json["error"]:
-                # Special parsing for the exact schema error you found
                 err_msg = json.dumps(err_json["error"])
         except Exception: pass
         raise RuntimeError(f"HTTP {response.status_code}: {err_msg}")
@@ -213,24 +258,14 @@ def set_delta_leverage(symbol, leverage):
     if not product or not product.get("id"): raise RuntimeError(f"{symbol}: Product ID missing")
     return delta_request("POST", f"/v2/products/{product['id']}/orders/leverage", body={"leverage": int(leverage)}, authenticated=True)
 
-# FIXED GET_CANDLES FUNCTION WITH START AND END TIMESTAMPS
 def get_candles(symbol, resolution="5m", limit=160):
     end_time = int(time.time())
-    
-    # Calculate start time based on resolution
-    # Adding a 10 candle buffer just to be safe
     if resolution == "1h":
         start_time = end_time - ((limit + 10) * 3600)
-    else: # 5m
+    else: 
         start_time = end_time - ((limit + 10) * 300)
 
-    params = {
-        "symbol": symbol, 
-        "resolution": resolution, 
-        "start": start_time,
-        "end": end_time
-    }
-    
+    params = {"symbol": symbol, "resolution": resolution, "start": start_time, "end": end_time}
     data = delta_request("GET", "/v2/history/candles", params=params, authenticated=False)
     candles = []
     
@@ -241,8 +276,6 @@ def get_candles(symbol, resolution="5m", limit=160):
         except Exception: continue
         
     candles.sort(key=lambda x: x["time"])
-    
-    # Trim to exactly the limit requested
     return candles[-limit:] if len(candles) > limit else candles
 
 def get_position_for_symbol(symbol):
@@ -480,10 +513,11 @@ def close_trade(price, reason):
     return True
 
 # ============================================================
-# MASTER SCANNER
+# MASTER SCANNER & EMAIL TRIGGER
 # ============================================================
 
 def scan_all_coins():
+    global backend_notified_signals
     results = {}
     has_global_error = False
     
@@ -501,6 +535,15 @@ def scan_all_coins():
             
             with lock: state["coins"][symbol]["last_signal"] = signal
             results[symbol] = signal
+            
+            # TRIGGER EMAIL ALERTS IF SETUP IS READY
+            if signal["score"] >= 75 and signal["side"] in ["LONG", "SHORT"]:
+                if backend_notified_signals[symbol] != signal["side"]:
+                    backend_notified_signals[symbol] = signal["side"]
+                    threading.Thread(target=send_email_alert, args=(symbol, signal["side"], signal["trigger_price"]), daemon=True).start()
+            elif signal["side"] == "NO_TRADE":
+                backend_notified_signals[symbol] = None
+            
             time.sleep(0.3) 
             
         except Exception as exc:
@@ -518,6 +561,7 @@ def scan_all_coins():
     return results
 
 def trading_cycle():
+    runtime["is_scanning"] = True
     try:
         signals = scan_all_coins()
 
@@ -555,13 +599,15 @@ def trading_cycle():
 
     except Exception as exc:
         runtime["last_scan_error"] = f"Engine Error: {str(exc)}"
+    finally:
+        runtime["is_scanning"] = False
+        runtime["last_scan"] = time.time()
 
 def engine_loop():
     event("🟢 Background Scanner Engine Started.")
     while True:
         started = time.time()
         trading_cycle()
-        runtime["last_scan"] = time.time()
         time.sleep(max(0.5, SCAN_SECONDS - (time.time() - started)))
 
 # ============================================================
@@ -573,7 +619,7 @@ def api_state():
     with lock: snapshot = json.loads(json.dumps(state))
     cmc_status = refresh_cmc_if_needed(force=False)
     snapshot["runtime"] = runtime
-    snapshot["engine_running"] = bool(time.time() - runtime["last_scan"] < 15)
+    snapshot["engine_running"] = runtime["is_scanning"] or bool(time.time() - runtime["last_scan"] < 15)
     snapshot["cmc_connected"] = cmc_status["connected"]
     snapshot["cmc_error"] = cmc_status["error"]
     return jsonify(snapshot)
@@ -720,7 +766,7 @@ button:hover { background: #172b43; }
 
 <header>
     <h1>Prime Minister AI (Pro Sniper)</h1>
-    <div class="subtitle">Multi-Timeframe Smart Trigger System</div>
+    <div class="subtitle">Multi-Timeframe Trigger & Email Alert System</div>
 </header>
 
 <div class="container">
@@ -779,7 +825,10 @@ button:hover { background: #172b43; }
             <button onclick="closeModal()">X</button>
         </div>
         <div id="rules" style="margin-top:14px"></div>
-        <div class="form-row"><label>Quantity</label><input id="quantity" type="number" step="any" oninput="calculateMargin()" /></div>
+        <div class="form-row">
+            <label>Quantity (Lots/Contracts) <span id="coinEquivalent" style="color:#ffc857; font-weight:bold; margin-left: 10px;">--</span></label>
+            <input id="quantity" type="number" step="1" oninput="calculateMargin()" />
+        </div>
         <div class="form-row"><label>Leverage</label><select id="leverage" onchange="calculateMargin()"></select></div>
         <div id="marginDisplay" class="margin-calc">Estimated Margin Required: -- USD</div>
         <div class="controls" style="margin-top:16px">
@@ -793,11 +842,6 @@ button:hover { background: #172b43; }
 let appState = null;
 let selectedModalCoin = null;
 let currentModalRules = null;
-let lastNotifiedSignals = { error: null };
-
-if (Notification.permission !== "granted" && Notification.permission !== "denied") {
-    Notification.requestPermission();
-}
 
 function money(value) {
     if (value === null || value === undefined) return "--";
@@ -820,38 +864,22 @@ function calculateMargin() {
     const cv = currentModalRules.contract_value || 1;
     
     if(qty > 0 && lev > 0 && price > 0) {
-        const margin = (qty * cv * price) / lev;
-        document.getElementById("marginDisplay").innerText = `Estimated Margin Required: $${margin.toFixed(2)}`;
+        const notional = qty * cv * price;
+        const pure_margin = notional / lev;
+        const delta_buffer = notional * 0.0015; 
+        const total_margin = pure_margin + delta_buffer;
+        
+        document.getElementById("marginDisplay").innerText = `Estimated Margin Required: ~$${total_margin.toFixed(2)}`;
+        const symbolBase = selectedModalCoin.replace("USD", "");
+        document.getElementById("coinEquivalent").innerText = `(Equivalent to ${(qty * cv).toFixed(4)} ${symbolBase})`;
     } else {
         document.getElementById("marginDisplay").innerText = `Estimated Margin Required: -- USD`;
-    }
-}
-
-function checkAndNotify(state) {
-    if (state.runtime.last_scan_error) {
-        if (lastNotifiedSignals["error"] !== state.runtime.last_scan_error) {
-            lastNotifiedSignals["error"] = state.runtime.last_scan_error;
-            if (Notification.permission === "granted") new Notification("⚠️ Error Alert", { body: state.runtime.last_scan_error });
-        }
-    } else { lastNotifiedSignals["error"] = null; }
-
-    for (const symbol of ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD"]) {
-        const signal = state.coins[symbol]?.last_signal;
-        if (!signal) continue;
-        if (signal.score >= 75 && signal.side !== "NO_TRADE") {
-            if (lastNotifiedSignals[symbol] !== signal.side) {
-                lastNotifiedSignals[symbol] = signal.side;
-                if (Notification.permission === "granted") {
-                    new Notification(`🚀 Setup Ready: ${symbol}`, { body: `Target Breakout Price: ${signal.trigger_price.toFixed(2)}` });
-                }
-            }
-        } else { lastNotifiedSignals[symbol] = null; }
+        document.getElementById("coinEquivalent").innerText = `--`;
     }
 }
 
 function render(state) {
     appState = state;
-    checkAndNotify(state);
 
     document.getElementById("public_ip").innerText = state.runtime.public_ip || "Loading...";
     const system = document.getElementById("system");
@@ -906,7 +934,7 @@ function render(state) {
             <div class="reason">${signal.reason || ""}</div>
             <div class="meta">
                 <span>Score: ${signal.score ?? 0}</span>
-                <span>Qty: ${coin.quantity}</span>
+                <span>Qty (Lots): ${coin.quantity}</span>
                 <span>${coin.leverage}x</span>
             </div>
         `;
@@ -927,7 +955,7 @@ function renderTrade(state) {
             <div><div class="label">SIDE</div><div class="value ${signalClass(trade.side)}">${trade.side}</div></div>
             <div><div class="label">ENTRY</div><div class="value">${money(trade.entry)}</div></div>
             <div><div class="label">TRAILING STOP</div><div class="value yellow">${money(trade.stop)}</div></div>
-            <div><div class="label">QTY</div><div class="value">${trade.quantity}</div></div>
+            <div><div class="label">QTY (LOTS)</div><div class="value">${trade.quantity}</div></div>
             <div><div class="label">LEVERAGE</div><div class="value">${trade.leverage}x</div></div>
         </div>
     `;
@@ -939,10 +967,11 @@ function renderEvents(state) {
     for (const item of (state.events || [])) {
         const div = document.createElement("div");
         div.className = "event-item";
-        if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed") || item.message.includes("HTTP")) div.style.color = "#ff6577";
+        if (item.message.toLowerCase().includes("error") || item.message.toLowerCase().includes("failed") || item.message.includes("http")) div.style.color = "#ff6577";
         else if (item.message.includes("Trailing Stop")) div.style.color = "#ffc857";
         else if (item.message.includes("EXECUTED") || item.message.includes("ARMED") || item.message.includes("Started")) div.style.color = "#45e09b";
         else if (item.message.includes("EXPIRED") || item.message.includes("DISARMED") || item.message.includes("Paused")) div.style.color = "#8294aa";
+        else if (item.message.includes("Email")) div.style.color = "#42a5f5";
         
         div.innerText = `${item.time.split('T')[1].slice(0,8)} — ${item.message}`;
         box.appendChild(div);
@@ -1015,17 +1044,20 @@ function renderRules(rules) {
 
     box.innerHTML = `
         <div class="rule"><span>Contract Value</span><span>${rules.contract_value ?? "--"}</span></div>
-        <div class="rule"><span>Min qty</span><span>${rules.min_quantity ?? "--"}</span></div>
-        <div class="rule"><span>Max qty</span><span>${rules.max_quantity ?? "--"}</span></div>
-        <div class="rule"><span>Step</span><span>${rules.quantity_step ?? "--"}</span></div>
+        <div class="rule"><span>Min qty</span><span>${rules.min_quantity ?? "--"} Lots</span></div>
+        <div class="rule"><span>Max qty</span><span>${rules.max_quantity ?? "--"} Lots</span></div>
+        <div class="rule"><span>Step</span><span>${rules.quantity_step ?? "--"} Lots</span></div>
         <div class="rule"><span>Max lev</span><span>${max}x</span></div>
     `;
 
     const select = document.getElementById("leverage");
     select.innerHTML = "";
-    const common = [1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100];
+    
+    // DYNAMIC LEVERAGE LIST - Purely from Delta API Rules (No Hardcoded 100x Limit)
+    const common = [1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 125, 150, 200];
     const values = common.filter(v => v >= min && v <= max);
-    if (values.length === 0) values.push(min);
+    if (!values.includes(min)) values.unshift(min);
+    if (!values.includes(max)) values.push(max);
 
     for (const value of values) {
         const opt = document.createElement("option");
@@ -1073,7 +1105,6 @@ def index():
     return render_template_string(HTML)
 
 def startup():
-    get_public_ip()
     threading.Thread(target=ip_updater_loop, daemon=True).start()
     threading.Thread(target=engine_loop, daemon=True).start()
 
