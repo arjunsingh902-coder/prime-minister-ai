@@ -19,7 +19,6 @@ app = Flask(__name__)
 
 DELTA_BASE = "https://api.india.delta.exchange"
 STATE_FILE = "bot_state.json"
-LOCK_FILE = "engine.lock"
 
 API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
@@ -31,11 +30,10 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
 
-USER_AGENT = "PrimeMinisterAI/Production-v1"
+USER_AGENT = "PrimeMinisterAI/Production-Final"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 3600
-CMC_CACHE_SECONDS = 1800 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD"]
@@ -48,13 +46,12 @@ lock = threading.RLock()
 engine_thread = None
 
 product_cache = {"timestamp": 0, "data": []}
-cmc_cache = {"timestamp": 0, "data": {}, "error": None}
 
 runtime = {
-    "started_at": None,
+    "started_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
     "last_scan": 0,
     "last_scan_error": None,
-    "public_ip": None,
+    "public_ip": "Loading...",
     "is_scanning": False
 }
 
@@ -62,9 +59,9 @@ backend_notified_signals = {symbol: None for symbol in SYMBOLS}
 
 def default_coin_state():
     return {
-        "enabled": False, "quantity": 1, "leverage": 2, "rules": {},
+        "enabled": False, "quantity": 1, "leverage": 2,
         "armed_signal": None,  
-        "last_signal": {"side": "NO_TRADE", "score": 0, "price": None, "trigger_price": None, "reason": "Waiting for market data", "updated_at": None}
+        "last_signal": {"side": "NO_TRADE", "score": 0, "price": None, "trigger_price": None, "reason": "Waiting...", "updated_at": None}
     }
 
 def default_state():
@@ -107,7 +104,7 @@ def event(message):
 # HELPER FUNCTIONS
 # ============================================================
 
-def send_email_alert(symbol, side, trigger_price, tick_size):
+def send_email_alert(symbol, side, trigger_price):
     if not EMAIL_SENDER or not EMAIL_PASSWORD: return 
     tp_str = f"{trigger_price:.8f}".rstrip('0').rstrip('.') if trigger_price else str(trigger_price)
     subject = f"🚀 {symbol} {side} Setup Ready!"
@@ -119,7 +116,6 @@ def send_email_alert(symbol, side, trigger_price, tick_size):
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.send_message(msg)
-            event(f"📧 Email Alert Sent for {symbol}")
     except Exception: pass 
 
 def get_public_ip():
@@ -128,7 +124,7 @@ def get_public_ip():
         ip = res.json().get("ip")
         if ip: runtime["public_ip"] = ip
     except Exception:
-        if not runtime.get("public_ip"): runtime["public_ip"] = "IP Loading Error"
+        if "Loading" in runtime.get("public_ip", ""): runtime["public_ip"] = "IP Loading Error (Safe to ignore)"
 
 def round_to_tick(price, tick_size):
     if price is None or tick_size is None or tick_size <= 0: return price
@@ -152,7 +148,8 @@ def delta_request(method, path, params=None, body=None, authenticated=False):
         signature = hmac.new(API_SECRET.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
         headers.update({"api-key": API_KEY, "timestamp": timestamp, "signature": signature})
 
-    res = requests.request(method.upper(), url, params=params, data=body_text if body else None, headers=headers, timeout=5)
+    res = requests.request(method.upper(), url, params=params, data=body_text if body else None, headers=headers, timeout=10)
+    
     if res.status_code >= 400:
         err = res.text
         try: err = res.json().get("error", {}).get("message", err)
@@ -177,16 +174,14 @@ def product_rules(symbol):
     for p in get_products():
         if str(p.get("symbol", "")).upper() == symbol.upper():
             return {
-                "available": True, "id": p.get("id"), "symbol": p.get("symbol"),
+                "id": p.get("id"),
                 "contract_value": float(p.get("contract_value", 1)),
-                "min_quantity": float(p.get("min_order_size", 1)),
-                "quantity_step": float(p.get("size_increment") or p.get("order_size_increment") or p.get("step_size") or 1),
-                "tick_size": float(p.get("tick_size") or 0.001),
-                "max_leverage": float(p.get("max_leverage") or p.get("leverage") or 100),
+                "quantity_step": float(p.get("size_increment") or p.get("step_size") or 1),
+                "tick_size": float(p.get("tick_size") or 0.001)
             }
-    return {"available": False, "message": "Product unavailable"}
+    return {"id": None, "quantity_step": 1, "tick_size": 0.001, "contract_value": 1}
 
-def get_candles(symbol, resolution="5m", limit=160):
+def get_candles(symbol, resolution="5m", limit=100):
     end_time = int(time.time())
     start_time = end_time - ((limit + 10) * (3600 if resolution == "1h" else 300))
     res = delta_request("GET", "/v2/history/candles", params={"symbol": symbol, "resolution": resolution, "start": start_time, "end": end_time})
@@ -207,12 +202,17 @@ def get_position(symbol):
         return "NO_POSITION"
     except Exception: return None
 
-def cancel_all_orders(symbol):
-    try: delta_request("DELETE", "/v2/orders", params={"product_symbol": symbol}, authenticated=True)
-    except Exception: pass
+def cancel_sl_orders(symbol):
+    """Cancels ONLY Stop Orders, protecting manual Take Profits"""
+    try:
+        orders = delta_request("GET", "/v2/orders", params={"state": "open", "product_symbol": symbol}, authenticated=True).get("result", [])
+        for o in orders:
+            if o.get("order_type") == "stop_order":
+                delta_request("DELETE", "/v2/orders", body={"id": o["id"], "product_symbol": symbol}, authenticated=True)
+    except Exception as e: pass
 
 # ============================================================
-# STRATEGY
+# STRATEGY LOGIC
 # ============================================================
 
 def ema(values, period):
@@ -244,14 +244,14 @@ def atr(candles, period=14):
     return curr
 
 def calculate_signal(symbol):
-    candles_1h = get_candles(symbol, "1h", CANDLE_LIMIT_HTF)
+    candles_1h = get_candles(symbol, "1h", 60)
     trend_1h = "NEUTRAL"
     if len(candles_1h) > 21:
         c1h = [x["close"] for x in candles_1h]
         e9, e21 = ema(c1h, 9), ema(c1h, 21)
         if e9 and e21: trend_1h = "UP" if e9 > e21 else "DOWN"
 
-    candles_5m = get_candles(symbol, "5m", CANDLE_LIMIT_LTF)
+    candles_5m = get_candles(symbol, "5m", 160)
     if len(candles_5m) < 60: return {"side": "NO_TRADE", "score": 0, "price": None, "reason": "Loading Data"}
     
     closes, volumes = [x["close"] for x in candles_5m], [x["volume"] for x in candles_5m]
@@ -286,18 +286,18 @@ def calculate_signal(symbol):
 
     if ls >= 75 and ls >= ss + 15 and trend_1h != "DOWN":
         tp = round_to_tick(rh + (atr_v * 0.1), tick)
-        return {"side": "LONG", "score": min(ls, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rl), "atr": atr_v, "updated_at": datetime.now(IST).isoformat()}
+        return {"side": "LONG", "score": min(ls, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rl), "atr": atr_v}
     elif ss >= 75 and ss >= ls + 15 and trend_1h != "UP":
         tp = round_to_tick(rl_m - (atr_v * 0.1), tick)
-        return {"side": "SHORT", "score": min(ss, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rs), "atr": atr_v, "updated_at": datetime.now(IST).isoformat()}
+        return {"side": "SHORT", "score": min(ss, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rs), "atr": atr_v}
     
-    return {"side": "NO_TRADE", "score": max(ls, ss), "price": price, "trigger_price": None, "reason": "No Edge", "atr": atr_v, "updated_at": datetime.now(IST).isoformat()}
+    return {"side": "NO_TRADE", "score": max(ls, ss), "price": price, "trigger_price": None, "reason": "No Edge", "atr": atr_v}
 
 # ============================================================
-# EXECUTION CORE
+# EXECUTION & TRADE MANAGEMENT
 # ============================================================
 
-def execute_trade(symbol, mode, armed_data):
+def execute_trade(symbol, mode, armed_data, current_price):
     try:
         rules = product_rules(symbol)
         raw_qty = float(state["coins"][symbol]["quantity"])
@@ -309,17 +309,18 @@ def execute_trade(symbol, mode, armed_data):
 
         side, entry_price, atr_val = armed_data["side"], armed_data["trigger_price"], armed_data["atr"]
         
-        sl_raw = entry_price - (atr_val * 1.5) if side == "LONG" else entry_price + (atr_val * 1.5)
+        # Calculate Hard SL
+        sl_raw = current_price - (atr_val * 1.5) if side == "LONG" else current_price + (atr_val * 1.5)
         stop_price = round_to_tick(sl_raw, tick_size)
 
         if mode == "LIVE":
             if get_position(symbol) != "NO_POSITION":
-                event(f"⚠️ Skipped: Position exists for {symbol}.")
+                event(f"⚠️ Skipped: Live Position already exists for {symbol}.")
                 return False
                 
             delta_request("POST", f"/v2/products/{rules['id']}/orders/leverage", body={"leverage": int(lev)}, authenticated=True)
             
-            # ATOMIC BRACKET ORDER (Delta Native)
+            # Atomic Bracket Order
             payload = {
                 "product_symbol": symbol, "size": qty, "side": "buy" if side == "LONG" else "sell",
                 "order_type": "market_order", "bracket_stop_loss_price": str(stop_price)
@@ -330,16 +331,16 @@ def execute_trade(symbol, mode, armed_data):
 
         with lock:
             state["current_trade"] = {
-                "symbol": symbol, "side": side, "entry": entry_price, "quantity": qty,
+                "symbol": symbol, "side": side, "entry": current_price, "quantity": qty,
                 "leverage": lev, "stop": stop_price, "entry_atr": atr_val,
-                "highest_price": entry_price, "lowest_price": entry_price, "mode": mode,
-                "exchange_order": result, "opened_at": datetime.now(IST).isoformat()
+                "highest_price": current_price, "lowest_price": current_price, "mode": mode,
+                "opened_at": datetime.now(IST).isoformat()
             }
             state["coins"][symbol]["armed_signal"] = None
         
         save_state()
         tp_str = f"{stop_price:.8f}".rstrip('0').rstrip('.')
-        event(f"🚀 {mode} EXECUTED: {symbol} {side}. Hard SL: {tp_str}")
+        event(f"🚀 {mode} EXECUTED: {symbol} {side} @ {current_price}. SL: {tp_str}")
         return True
     except Exception as e:
         event(f"❌ Execution Error on {symbol}: {e}")
@@ -353,72 +354,89 @@ def manage_active_trade():
     tick_size = float(rules.get("tick_size", 0.001))
     
     try:
+        # STATELESS SYNC for LIVE MODE
         if trade["mode"] == "LIVE":
             pos = get_position(symbol)
             if pos == "NO_POSITION":
-                cancel_all_orders(symbol)
+                cancel_sl_orders(symbol)
                 with lock: state["current_trade"] = None
                 save_state()
-                event(f"🔒 {symbol} Trade closed on exchange.")
+                event(f"🔒 {symbol} Trade closed on exchange (Target/SL hit).")
                 return
-            elif pos is None: return
+            elif pos is None: return # API Error, skip this cycle
 
         candles = get_candles(symbol, "5m", 10)
         if not candles: return
-        price, side, atr_val = candles[-1]["close"], trade["side"], trade.get("entry_atr", 10)
+        live_price, side, atr_val = candles[-1]["close"], trade["side"], trade.get("entry_atr", 10)
 
+        # PAPER MODE SL CHECK
+        if trade["mode"] == "PAPER":
+            if (side == "LONG" and live_price <= trade["stop"]) or (side == "SHORT" and live_price >= trade["stop"]):
+                with lock: state["current_trade"] = None
+                save_state()
+                event(f"🔒 PAPER {symbol} Trade closed (Stop Loss Hit).")
+                return
+
+        # TRAILING STOP LOSS LOGIC
         with lock:
             if side == "LONG":
-                if price > trade.get("highest_price", trade["entry"]):
-                    trade["highest_price"] = price
-                    new_sl = round_to_tick(price - (atr_val * 1.5), tick_size)
+                if live_price > trade.get("highest_price", trade["entry"]):
+                    trade["highest_price"] = live_price
+                    new_sl = round_to_tick(live_price - (atr_val * 1.5), tick_size)
                     if new_sl > trade["stop"]:
                         trade["stop"] = new_sl
                         if trade["mode"] == "LIVE":
-                            cancel_all_orders(symbol)
+                            cancel_sl_orders(symbol)
                             delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
-                        event(f"📈 Trailing SL (L) Moved to: {new_sl}")
+                        event(f"📈 Trailing SL Moved UP to: {new_sl}")
 
             elif side == "SHORT":
-                if price < trade.get("lowest_price", trade["entry"]):
-                    trade["lowest_price"] = price
-                    new_sl = round_to_tick(price + (atr_val * 1.5), tick_size)
+                if live_price < trade.get("lowest_price", trade["entry"]):
+                    trade["lowest_price"] = live_price
+                    new_sl = round_to_tick(live_price + (atr_val * 1.5), tick_size)
                     if new_sl < trade["stop"]:
                         trade["stop"] = new_sl
                         if trade["mode"] == "LIVE":
-                            cancel_all_orders(symbol)
+                            cancel_sl_orders(symbol)
                             delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
-                        event(f"📉 Trailing SL (S) Moved to: {new_sl}")
+                        event(f"📉 Trailing SL Moved DOWN to: {new_sl}")
         save_state()
-    except Exception as exc: event(f"Trade management error: {exc}")
+    except Exception as exc: 
+        event(f"Trade sync error: {exc}")
 
-def close_trade():
+def close_trade_manual():
     with lock: trade = state["current_trade"]
     if not trade: return False
+    
     if trade["mode"] == "LIVE":
         try:
-            cancel_all_orders(trade["symbol"])
+            cancel_sl_orders(trade["symbol"])
             pos = get_position(trade["symbol"])
             if pos and pos != "NO_POSITION":
-                delta_request("POST", "/v2/orders", body={"product_symbol": trade["symbol"], "size": abs(float(pos["size"])), "side": "sell" if str(pos.get("side", "")).lower() == "buy" else "buy", "order_type": "market_order", "reduce_only": True}, authenticated=True)
+                # Delta sizes are positive for Long, negative for Short
+                actual_size = float(pos["size"])
+                side_to_close = "sell" if actual_size > 0 else "buy"
+                
+                delta_request("POST", "/v2/orders", body={
+                    "product_symbol": trade["symbol"], "size": abs(actual_size), 
+                    "side": side_to_close, "order_type": "market_order", "reduce_only": True
+                }, authenticated=True)
         except Exception as e:
             event(f"❌ Failed to close LIVE trade: {e}")
             return False
-    event(f"🔒 {trade['mode']} trade closed manually.")
+            
+    event(f"🔒 {trade['mode']} trade closed manually via Dashboard.")
     with lock: state["current_trade"] = None
     save_state()
     return True
 
 # ============================================================
-# ENGINE
+# BACKGROUND ENGINE
 # ============================================================
 
 def engine_loop():
-    if os.path.exists(LOCK_FILE): return
-    with open(LOCK_FILE, "w") as f: f.write("LOCKED")
-    
     get_public_ip()
-    event("🟢 Master Engine Started (IST Timezone Active).")
+    event("🟢 Master Sniper Engine Started.")
     
     while True:
         runtime["is_scanning"] = True
@@ -431,35 +449,49 @@ def engine_loop():
                     
                     if sig["score"] >= 75 and sig["side"] in ["LONG", "SHORT"] and backend_notified_signals[sym] != sig["side"]:
                         backend_notified_signals[sym] = sig["side"]
-                        threading.Thread(target=send_email_alert, args=(sym, sig["side"], sig["trigger_price"], product_rules(sym).get("tick_size")), daemon=True).start()
+                        threading.Thread(target=send_email_alert, args=(sym, sig["side"], sig["trigger_price"]), daemon=True).start()
                     elif sig["side"] == "NO_TRADE": backend_notified_signals[sym] = None
                     time.sleep(1)
                 except Exception as e:
                     has_err = True
-                    runtime["last_scan_error"] = f"{sym}: {e}"
+                    runtime["last_scan_error"] = f"{sym} Sync Error"
                     time.sleep(1)
             
             if not has_err: runtime["last_scan_error"] = None
 
             with lock: trade = state["current_trade"]
-            if trade: manage_active_trade()
+            if trade: 
+                manage_active_trade()
             elif state["system_on"]:
                 sel = state["selected_coin"]
                 if sel and state["coins"][sel]["enabled"] and state["coins"][sel].get("armed_signal"):
                     arm = state["coins"][sel]["armed_signal"]
+                    
                     if time.time() > arm["expiry_time"]:
                         with lock: state["coins"][sel]["enabled"], state["coins"][sel]["armed_signal"], state["selected_coin"] = False, None, None
-                        event(f"⏳ {sel} Signal EXPIRED.")
+                        event(f"⏳ {sel} Setup EXPIRED (20 mins). Disarmed.")
                     else:
-                        cp = state["coins"][sel]["last_signal"].get("price")
-                        if cp and ((arm["side"]=="LONG" and cp >= arm["trigger_price"]) or (arm["side"]=="SHORT" and cp <= arm["trigger_price"])):
-                            execute_trade(sel, state["mode"], arm)
+                        live_price = state["coins"][sel]["last_signal"].get("price")
+                        if live_price:
+                            # Dynamic Breakout Check
+                            if (arm["side"] == "LONG" and live_price >= arm["trigger_price"]) or \
+                               (arm["side"] == "SHORT" and live_price <= arm["trigger_price"]):
+                                execute_trade(sel, state["mode"], arm, live_price)
         except Exception: pass
         finally:
             runtime["is_scanning"] = False
             runtime["last_scan"] = time.time()
             save_state()
             time.sleep(SCAN_SECONDS)
+
+# Ensure thread starts properly with Gunicorn
+def start_engine():
+    global engine_thread
+    if engine_thread is None or not engine_thread.is_alive():
+        engine_thread = threading.Thread(target=engine_loop, daemon=True)
+        engine_thread.start()
+
+start_engine()
 
 # ============================================================
 # API ROUTES
@@ -478,7 +510,7 @@ def api_state():
 @app.route("/api/coin/<symbol>/rules", methods=["GET"])
 def api_rules(symbol):
     r = product_rules(symbol.upper())
-    return jsonify({"success": r.get("available", False), "rules": r, "error": r.get("message")})
+    return jsonify({"success": r.get("id") is not None, "rules": r})
 
 @app.route("/api/coin/<symbol>/settings", methods=["POST"])
 def api_settings(symbol):
@@ -496,19 +528,19 @@ def api_toggle(symbol):
             for s in SYMBOLS: state["coins"][s]["enabled"] = (s == symbol.upper())
             state["selected_coin"] = symbol.upper()
             state["coins"][symbol.upper()]["enabled"] = True
-            state["coins"][symbol.upper()]["armed_signal"] = {"side": sig["side"], "trigger_price": sig["trigger_price"], "expiry_time": time.time() + 1200, "atr": sig["atr"], "reason": sig["reason"]}
+            state["coins"][symbol.upper()]["armed_signal"] = {"side": sig["side"], "trigger_price": sig["trigger_price"], "expiry_time": time.time() + 1200, "atr": sig["atr"]}
         tp_str = f"{sig['trigger_price']:.8f}".rstrip('0').rstrip('.')
-        event(f"🔫 {symbol.upper()} ARMED. Target: {tp_str}")
+        event(f"🔫 {symbol.upper()} ARMED. Breakout Target: {tp_str}")
     else:
         with lock: state["coins"][symbol.upper()]["enabled"], state["coins"][symbol.upper()]["armed_signal"], state["selected_coin"] = False, None, None
-        event(f"🛑 {symbol.upper()} DISARMED.")
+        event(f"🛑 {symbol.upper()} DISARMED manually.")
     save_state()
     return jsonify({"success": True})
 
 @app.route("/api/system", methods=["POST"])
 def api_system():
+    # Removed the IP Block check. System will turn ON regardless.
     en = bool(request.get_json(silent=True).get("enabled"))
-    if en and ("Error" in str(runtime.get("public_ip")) or not runtime.get("public_ip")): return jsonify({"success": False, "error": "IP not verified"}), 400
     with lock: state["system_on"] = en
     save_state()
     event(f"{'⚡ SYSTEM ON' if en else '⏸️ SYSTEM OFF'}")
@@ -516,15 +548,15 @@ def api_system():
 
 @app.route("/api/mode", methods=["POST"])
 def api_mode():
-    if state["current_trade"]: return jsonify({"success": False, "error": "Trade active"}), 400
+    if state["current_trade"]: return jsonify({"success": False, "error": "Cannot change mode during active trade"}), 400
     with lock: state["mode"] = str(request.get_json(silent=True).get("mode", "")).upper()
     save_state()
     return jsonify({"success": True})
 
 @app.route("/api/trade/close", methods=["POST"])
 def api_trade_close():
-    if close_trade(): return jsonify({"success": True})
-    return jsonify({"success": False, "error": "Failed to close trade"}), 500
+    if close_trade_manual(): return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Failed to close trade. Check Delta app."}), 500
 
 # ============================================================
 # HTML UI
@@ -536,7 +568,7 @@ HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Prime Minister AI</title>
+<title>Prime Minister AI (Pro)</title>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; background: #07111f; color: #e8eef7; font-family: Inter, system-ui, sans-serif; }
@@ -591,7 +623,7 @@ button:hover { background: #172b43; }
 <body>
 <header>
     <h1>Prime Minister AI (Pro)</h1>
-    <div class="subtitle">IST Engine | Bracket SL | Full Precision</div>
+    <div class="subtitle">Stateless Engine | Bracket SL | IST Enabled</div>
 </header>
 <div class="container">
     <div class="topbar">
@@ -610,13 +642,13 @@ button:hover { background: #172b43; }
     </div>
     <div class="section"><div class="panel"><div class="label">CONNECTIONS & HEALTH</div><div id="connections" style="margin-top:12px"></div></div></div>
     <div class="section"><div class="panel"><div class="label">MARKET WATCH (Click to ARM)</div><div id="coins" class="coin-grid" style="margin-top:12px"></div></div></div>
-    <div class="section"><div class="panel"><div class="label">ACTIVE TRADE</div><div id="trade" style="margin-top:12px">None</div></div></div>
+    <div class="section"><div class="panel"><div class="label">ACTIVE TRADE (Hard SL Managed)</div><div id="trade" style="margin-top:12px">None</div></div></div>
     <div class="section"><div class="panel"><div class="label">EVENTS LOG (IST)</div><div id="events" class="event-list" style="margin-top:12px"></div></div></div>
 </div>
 <div id="modal" class="modal">
     <div class="modal-box">
         <div class="modal-header">
-            <div><div id="modalTitle" style="font-size:20px; font-weight:800;"></div><div id="modalSubtitle" class="small">Delta product rules</div></div>
+            <div><div id="modalTitle" style="font-size:20px; font-weight:800;"></div><div id="modalSubtitle" class="small" style="color:#71849a;font-size:11px;">Delta product rules</div></div>
             <button onclick="document.getElementById('modal').classList.remove('show')">X</button>
         </div>
         <div id="rules" style="margin-top:14px"></div>
@@ -656,7 +688,7 @@ function render(s) {
     document.getElementById("selected").innerText = s.selected_coin || "None";
     
     document.getElementById("connections").innerHTML = `
-        <div class="rule"><span>Delta API</span><span class="${s.runtime.last_scan_error?'red':'green'}">${s.runtime.last_scan_error?'ERROR':'READY'}</span></div>
+        <div class="rule"><span>Delta API</span><span class="${s.runtime.last_scan_error?'red':'green'}">${s.runtime.last_scan_error||'READY'}</span></div>
         <div class="rule"><span>Scanner</span><span class="${s.engine_running?'green':'red'}">${s.engine_running?'LIVE':'STOPPED'}</span></div>
     `;
 
@@ -674,11 +706,11 @@ function render(s) {
                 if(d.success) { 
                     currentRules = d.rules; 
                     const sel = document.getElementById("leverage"); sel.innerHTML="";
-                    [1,2,3,5,10,15,20,25,30,40,50,75,100].filter(v=>v<=d.rules.max_leverage).forEach(v=>{
+                    [1,2,3,5,10,15,20,25,30,40,50,75,100].forEach(v=>{
                         const opt = document.createElement("option"); opt.value=v; opt.innerText=v+"x";
                         if(c.leverage==v) opt.selected=true; sel.appendChild(opt);
                     });
-                    document.getElementById("rules").innerHTML = `<div class="rule"><span>Min Qty</span><span>${d.rules.min_quantity}</span></div><div class="rule"><span>Step</span><span>${d.rules.quantity_step}</span></div><div class="rule"><span>Tick Size</span><span>${d.rules.tick_size}</span></div>`;
+                    document.getElementById("rules").innerHTML = `<div class="rule"><span>Contract</span><span>${d.rules.contract_value}</span></div><div class="rule"><span>Step</span><span>${d.rules.quantity_step}</span></div><div class="rule"><span>Tick Size</span><span>${d.rules.tick_size}</span></div>`;
                     calcMargin();
                 }
             } catch(e){}
@@ -687,7 +719,7 @@ function render(s) {
             <div class="coin-title"><div class="coin-name">${sym} <span class="setup-dot ${dclass}"></span></div>${c.enabled ? '<div class="badge badge-armed">ARMED</div>' : '<div class="badge">OFF</div>'}</div>
             <div class="signal ${sig.side==='LONG'?'green':sig.side==='SHORT'?'red':'gray'}">${sig.side}</div>
             <div class="price">${fmt(sig.price)}</div>
-            <div class="gray" style="font-size:12px; margin-top:5px;">${arm ? `⏳ Waiting: <b>${fmt(arm.trigger_price)}</b>` : (sig.trigger_price ? `Breakout: ${fmt(sig.trigger_price)}` : "")}</div>
+            <div class="gray" style="font-size:12px; margin-top:5px;">${arm ? `⏳ Waiting: <b>${fmt(arm.trigger_price)}</b>` : (sig.trigger_price ? `Breakout target: ${fmt(sig.trigger_price)}` : "")}</div>
             <div class="reason">${sig.reason||""}</div>
             <div class="meta"><span>Score: ${sig.score}</span><span>Qty: ${c.quantity}</span><span>${c.leverage}x</span></div>
         `;
@@ -704,7 +736,7 @@ function render(s) {
     s.events.forEach(e => {
         const div = document.createElement("div"); div.className = "event-item";
         if(e.message.includes("Error")||e.message.includes("Failed")) div.style.color="#ff6577";
-        else if(e.message.includes("EXECUTED")||e.message.includes("Started")) div.style.color="#45e09b";
+        else if(e.message.includes("EXECUTED")||e.message.includes("Started")||e.message.includes("ON")) div.style.color="#45e09b";
         else if(e.message.includes("Trailing")||e.message.includes("SL")) div.style.color="#ffc857";
         div.innerText = e.message; ebox.appendChild(div);
     });
@@ -723,6 +755,4 @@ load(); setInterval(load, 5000);
 """
 
 if __name__ == "__main__":
-    if not os.path.exists(LOCK_FILE):
-        threading.Thread(target=engine_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False, threaded=True)
