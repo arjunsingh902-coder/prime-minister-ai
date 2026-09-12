@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import threading
 import smtplib
+import socket
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 
@@ -30,7 +31,7 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
 
-USER_AGENT = "PrimeMinisterAI/Production-Final"
+USER_AGENT = "PrimeMinisterAI/Production-Ultimate"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 3600
@@ -44,6 +45,7 @@ SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD"]
 
 lock = threading.RLock()
 engine_thread = None
+engine_socket_lock = None # Prevents Gunicorn multi-worker clones
 
 product_cache = {"timestamp": 0, "data": []}
 
@@ -177,9 +179,11 @@ def product_rules(symbol):
                 "id": p.get("id"),
                 "contract_value": float(p.get("contract_value", 1)),
                 "quantity_step": float(p.get("size_increment") or p.get("step_size") or 1),
-                "tick_size": float(p.get("tick_size") or 0.001)
+                "tick_size": float(p.get("tick_size") or 0.001),
+                "min_leverage": float(p.get("min_leverage") or 1),
+                "max_leverage": float(p.get("max_leverage") or p.get("leverage") or 100)
             }
-    return {"id": None, "quantity_step": 1, "tick_size": 0.001, "contract_value": 1}
+    return {"id": None, "quantity_step": 1, "tick_size": 0.001, "contract_value": 1, "min_leverage": 1, "max_leverage": 100}
 
 def get_candles(symbol, resolution="5m", limit=100):
     end_time = int(time.time())
@@ -202,14 +206,11 @@ def get_position(symbol):
         return "NO_POSITION"
     except Exception: return None
 
-def cancel_sl_orders(symbol):
-    """Cancels ONLY Stop Orders, protecting manual Take Profits"""
+def cancel_specific_sl(symbol, sl_order_id):
+    if not sl_order_id: return
     try:
-        orders = delta_request("GET", "/v2/orders", params={"state": "open", "product_symbol": symbol}, authenticated=True).get("result", [])
-        for o in orders:
-            if o.get("order_type") == "stop_order":
-                delta_request("DELETE", "/v2/orders", body={"id": o["id"], "product_symbol": symbol}, authenticated=True)
-    except Exception as e: pass
+        delta_request("DELETE", "/v2/orders", body={"id": sl_order_id, "product_symbol": symbol}, authenticated=True)
+    except Exception: pass
 
 # ============================================================
 # STRATEGY LOGIC
@@ -309,9 +310,10 @@ def execute_trade(symbol, mode, armed_data, current_price):
 
         side, entry_price, atr_val = armed_data["side"], armed_data["trigger_price"], armed_data["atr"]
         
-        # Calculate Hard SL
         sl_raw = current_price - (atr_val * 1.5) if side == "LONG" else current_price + (atr_val * 1.5)
         stop_price = round_to_tick(sl_raw, tick_size)
+
+        sl_order_id = None
 
         if mode == "LIVE":
             if get_position(symbol) != "NO_POSITION":
@@ -325,7 +327,9 @@ def execute_trade(symbol, mode, armed_data, current_price):
                 "product_symbol": symbol, "size": qty, "side": "buy" if side == "LONG" else "sell",
                 "order_type": "market_order", "bracket_stop_loss_price": str(stop_price)
             }
-            delta_request("POST", "/v2/orders", body=payload, authenticated=True)
+            res = delta_request("POST", "/v2/orders", body=payload, authenticated=True)
+            if isinstance(res, dict) and "result" in res:
+                sl_order_id = "BRACKET_PENDING_SYNC" 
             result = "LIVE_BRACKET_PLACED"
         else: result = "PAPER_SIMULATION"
 
@@ -334,6 +338,7 @@ def execute_trade(symbol, mode, armed_data, current_price):
                 "symbol": symbol, "side": side, "entry": current_price, "quantity": qty,
                 "leverage": lev, "stop": stop_price, "entry_atr": atr_val,
                 "highest_price": current_price, "lowest_price": current_price, "mode": mode,
+                "sl_order_id": sl_order_id,
                 "opened_at": datetime.now(IST).isoformat()
             }
             state["coins"][symbol]["armed_signal"] = None
@@ -346,6 +351,39 @@ def execute_trade(symbol, mode, armed_data, current_price):
         event(f"❌ Execution Error on {symbol}: {e}")
         return False
 
+def sync_true_stateless():
+    if not API_KEY: return
+    try:
+        positions = delta_request("GET", "/v2/positions", authenticated=True).get("result", [])
+        active_pos = None
+        for p in positions:
+            if abs(float(p.get("size", 0))) > 0:
+                active_pos = p
+                break
+        
+        with lock:
+            if active_pos:
+                sym = active_pos.get("product_symbol")
+                size = float(active_pos.get("size", 0))
+                side = "LONG" if size > 0 else "SHORT"
+                entry = float(active_pos.get("entry_price", 0))
+                
+                # Adopt orphan trade if memory was wiped
+                if not state["current_trade"] or state["current_trade"]["symbol"] != sym:
+                    state["current_trade"] = {
+                        "symbol": sym, "side": side, "entry": entry, "quantity": abs(size),
+                        "leverage": 1, "stop": entry, "entry_atr": 0.001, # Placeholder
+                        "highest_price": entry, "lowest_price": entry, "mode": "LIVE",
+                        "sl_order_id": None, "opened_at": datetime.now(IST).isoformat()
+                    }
+                    event(f"🔗 Recovered Orphan Trade: {sym} {side} from Delta")
+            else:
+                if state["current_trade"] and state["current_trade"]["mode"] == "LIVE":
+                    state["current_trade"] = None
+                    event("🧹 Cleared stale local trade (No live positions found).")
+        save_state()
+    except Exception: pass
+
 def manage_active_trade():
     with lock: trade = state["current_trade"]
     if not trade: return
@@ -354,16 +392,15 @@ def manage_active_trade():
     tick_size = float(rules.get("tick_size", 0.001))
     
     try:
-        # STATELESS SYNC for LIVE MODE
         if trade["mode"] == "LIVE":
             pos = get_position(symbol)
             if pos == "NO_POSITION":
-                cancel_sl_orders(symbol)
+                cancel_specific_sl(symbol, trade.get("sl_order_id"))
                 with lock: state["current_trade"] = None
                 save_state()
                 event(f"🔒 {symbol} Trade closed on exchange (Target/SL hit).")
                 return
-            elif pos is None: return # API Error, skip this cycle
+            elif pos is None: return
 
         candles = get_candles(symbol, "5m", 10)
         if not candles: return
@@ -386,8 +423,9 @@ def manage_active_trade():
                     if new_sl > trade["stop"]:
                         trade["stop"] = new_sl
                         if trade["mode"] == "LIVE":
-                            cancel_sl_orders(symbol)
-                            delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
+                            cancel_specific_sl(symbol, trade.get("sl_order_id"))
+                            res = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "sell", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
+                            trade["sl_order_id"] = res.get("result", {}).get("id") if isinstance(res, dict) else None
                         event(f"📈 Trailing SL Moved UP to: {new_sl}")
 
             elif side == "SHORT":
@@ -397,8 +435,9 @@ def manage_active_trade():
                     if new_sl < trade["stop"]:
                         trade["stop"] = new_sl
                         if trade["mode"] == "LIVE":
-                            cancel_sl_orders(symbol)
-                            delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
+                            cancel_specific_sl(symbol, trade.get("sl_order_id"))
+                            res = delta_request("POST", "/v2/orders", body={"product_symbol": symbol, "size": trade["quantity"], "side": "buy", "order_type": "stop_order", "stop_price": str(new_sl), "reduce_only": True}, authenticated=True)
+                            trade["sl_order_id"] = res.get("result", {}).get("id") if isinstance(res, dict) else None
                         event(f"📉 Trailing SL Moved DOWN to: {new_sl}")
         save_state()
     except Exception as exc: 
@@ -410,10 +449,9 @@ def close_trade_manual():
     
     if trade["mode"] == "LIVE":
         try:
-            cancel_sl_orders(trade["symbol"])
+            cancel_specific_sl(trade["symbol"], trade.get("sl_order_id"))
             pos = get_position(trade["symbol"])
             if pos and pos != "NO_POSITION":
-                # Delta sizes are positive for Long, negative for Short
                 actual_size = float(pos["size"])
                 side_to_close = "sell" if actual_size > 0 else "buy"
                 
@@ -436,6 +474,7 @@ def close_trade_manual():
 
 def engine_loop():
     get_public_ip()
+    sync_true_stateless()
     event("🟢 Master Sniper Engine Started.")
     
     while True:
@@ -473,7 +512,6 @@ def engine_loop():
                     else:
                         live_price = state["coins"][sel]["last_signal"].get("price")
                         if live_price:
-                            # Dynamic Breakout Check
                             if (arm["side"] == "LONG" and live_price >= arm["trigger_price"]) or \
                                (arm["side"] == "SHORT" and live_price <= arm["trigger_price"]):
                                 execute_trade(sel, state["mode"], arm, live_price)
@@ -484,9 +522,16 @@ def engine_loop():
             save_state()
             time.sleep(SCAN_SECONDS)
 
-# Ensure thread starts properly with Gunicorn
 def start_engine():
-    global engine_thread
+    global engine_thread, engine_socket_lock
+    
+    # 100% GUNICORN MULTI-WORKER FIX (Socket Lock)
+    try:
+        engine_socket_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        engine_socket_lock.bind(("127.0.0.1", 47500))
+    except socket.error:
+        return
+
     if engine_thread is None or not engine_thread.is_alive():
         engine_thread = threading.Thread(target=engine_loop, daemon=True)
         engine_thread.start()
@@ -523,7 +568,8 @@ def api_settings(symbol):
 def api_toggle(symbol):
     if request.get_json(silent=True).get("enabled"):
         sig = state["coins"][symbol.upper()]["last_signal"]
-        if sig["side"] == "NO_TRADE": return jsonify({"success": False, "error": "No valid setup to arm."}), 400
+        if sig["side"] == "NO_TRADE": 
+            return jsonify({"success": False, "error": f"Cannot Arm: Score is {sig.get('score', 0)} (Need 75+ for Sniper Entry)."}), 400
         with lock:
             for s in SYMBOLS: state["coins"][s]["enabled"] = (s == symbol.upper())
             state["selected_coin"] = symbol.upper()
@@ -539,7 +585,6 @@ def api_toggle(symbol):
 
 @app.route("/api/system", methods=["POST"])
 def api_system():
-    # Removed the IP Block check. System will turn ON regardless.
     en = bool(request.get_json(silent=True).get("enabled"))
     with lock: state["system_on"] = en
     save_state()
@@ -623,7 +668,7 @@ button:hover { background: #172b43; }
 <body>
 <header>
     <h1>Prime Minister AI (Pro)</h1>
-    <div class="subtitle">Stateless Engine | Bracket SL | IST Enabled</div>
+    <div class="subtitle">Stateless Engine | Bracket SL | Full Range Lev.</div>
 </header>
 <div class="container">
     <div class="topbar">
@@ -706,7 +751,15 @@ function render(s) {
                 if(d.success) { 
                     currentRules = d.rules; 
                     const sel = document.getElementById("leverage"); sel.innerHTML="";
-                    [1,2,3,5,10,15,20,25,30,40,50,75,100].forEach(v=>{
+                    
+                    const minL = d.rules.min_leverage || 1;
+                    const maxL = d.rules.max_leverage || 100;
+                    let levList = [1,2,3,5,10,15,20,25,30,40,50,75,100,125,150,200].filter(v => v >= minL && v <= maxL);
+                    if(!levList.includes(minL)) levList.unshift(minL);
+                    if(!levList.includes(maxL)) levList.push(maxL);
+                    levList.sort((a,b)=>a-b);
+
+                    levList.forEach(v=>{
                         const opt = document.createElement("option"); opt.value=v; opt.innerText=v+"x";
                         if(c.leverage==v) opt.selected=true; sel.appendChild(opt);
                     });
@@ -736,7 +789,7 @@ function render(s) {
     s.events.forEach(e => {
         const div = document.createElement("div"); div.className = "event-item";
         if(e.message.includes("Error")||e.message.includes("Failed")) div.style.color="#ff6577";
-        else if(e.message.includes("EXECUTED")||e.message.includes("Started")||e.message.includes("ON")) div.style.color="#45e09b";
+        else if(e.message.includes("EXECUTED")||e.message.includes("Started")||e.message.includes("ON")||e.message.includes("Recovered")) div.style.color="#45e09b";
         else if(e.message.includes("Trailing")||e.message.includes("SL")) div.style.color="#ffc857";
         div.innerText = e.message; ebox.appendChild(div);
     });
