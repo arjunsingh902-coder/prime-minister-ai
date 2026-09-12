@@ -31,7 +31,7 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", EMAIL_SENDER).strip()
 
-USER_AGENT = "PrimeMinisterAI/Production-Ultimate"
+USER_AGENT = "PrimeMinisterAI/Production-Sniper"
 
 SCAN_SECONDS = 5
 PRODUCT_CACHE_SECONDS = 3600
@@ -45,7 +45,7 @@ SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD"]
 
 lock = threading.RLock()
 engine_thread = None
-engine_socket_lock = None # Prevents Gunicorn multi-worker clones
+engine_socket_lock = None 
 
 product_cache = {"timestamp": 0, "data": []}
 
@@ -63,7 +63,11 @@ def default_coin_state():
     return {
         "enabled": False, "quantity": 1, "leverage": 2,
         "armed_signal": None,  
-        "last_signal": {"side": "NO_TRADE", "score": 0, "price": None, "trigger_price": None, "reason": "Waiting...", "updated_at": None}
+        "last_signal": {
+            "side": "NO_TRADE", "score": 0, "price": None, 
+            "high": None, "low": None, # ADDED HIGH/LOW FOR SNIPER PRECISION
+            "trigger_price": None, "reason": "Waiting...", "updated_at": None
+        }
     }
 
 def default_state():
@@ -253,11 +257,14 @@ def calculate_signal(symbol):
         if e9 and e21: trend_1h = "UP" if e9 > e21 else "DOWN"
 
     candles_5m = get_candles(symbol, "5m", 160)
-    if len(candles_5m) < 60: return {"side": "NO_TRADE", "score": 0, "price": None, "reason": "Loading Data"}
+    if len(candles_5m) < 60: return {"side": "NO_TRADE", "score": 0, "price": None, "high": None, "low": None, "reason": "Loading Data"}
     
     closes, volumes = [x["close"] for x in candles_5m], [x["volume"] for x in candles_5m]
-    price, e9, e21, rsi_v, atr_v = closes[-1], ema(closes, 9), ema(closes, 21), rsi(closes, 14), atr(candles_5m, 14)
-    if None in (e9, e21, rsi_v, atr_v): return {"side": "NO_TRADE", "score": 0, "price": price, "reason": "Calc Indicators"}
+    curr_candle = candles_5m[-1]
+    price, high, low = curr_candle["close"], curr_candle["high"], curr_candle["low"]
+    
+    e9, e21, rsi_v, atr_v = ema(closes, 9), ema(closes, 21), rsi(closes, 14), atr(candles_5m, 14)
+    if None in (e9, e21, rsi_v, atr_v): return {"side": "NO_TRADE", "score": 0, "price": price, "high": high, "low": low, "reason": "Calc Indicators"}
 
     ls, ss, rl, rs = 0, 0, [], []
 
@@ -287,18 +294,18 @@ def calculate_signal(symbol):
 
     if ls >= 75 and ls >= ss + 15 and trend_1h != "DOWN":
         tp = round_to_tick(rh + (atr_v * 0.1), tick)
-        return {"side": "LONG", "score": min(ls, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rl), "atr": atr_v}
+        return {"side": "LONG", "score": min(ls, 100), "price": price, "high": high, "low": low, "trigger_price": tp, "reason": ", ".join(rl), "atr": atr_v}
     elif ss >= 75 and ss >= ls + 15 and trend_1h != "UP":
         tp = round_to_tick(rl_m - (atr_v * 0.1), tick)
-        return {"side": "SHORT", "score": min(ss, 100), "price": price, "trigger_price": tp, "reason": ", ".join(rs), "atr": atr_v}
+        return {"side": "SHORT", "score": min(ss, 100), "price": price, "high": high, "low": low, "trigger_price": tp, "reason": ", ".join(rs), "atr": atr_v}
     
-    return {"side": "NO_TRADE", "score": max(ls, ss), "price": price, "trigger_price": None, "reason": "No Edge", "atr": atr_v}
+    return {"side": "NO_TRADE", "score": max(ls, ss), "price": price, "high": high, "low": low, "trigger_price": None, "reason": "No Edge", "atr": atr_v}
 
 # ============================================================
 # EXECUTION & TRADE MANAGEMENT
 # ============================================================
 
-def execute_trade(symbol, mode, armed_data, current_price):
+def execute_trade(symbol, mode, armed_data, execute_price):
     try:
         rules = product_rules(symbol)
         raw_qty = float(state["coins"][symbol]["quantity"])
@@ -308,9 +315,9 @@ def execute_trade(symbol, mode, armed_data, current_price):
         tick_size = float(rules.get("tick_size", 0.001))
         qty = max(step_size, round(raw_qty / step_size) * step_size)
 
-        side, entry_price, atr_val = armed_data["side"], armed_data["trigger_price"], armed_data["atr"]
+        side, atr_val = armed_data["side"], armed_data["atr"]
         
-        sl_raw = current_price - (atr_val * 1.5) if side == "LONG" else current_price + (atr_val * 1.5)
+        sl_raw = execute_price - (atr_val * 1.5) if side == "LONG" else execute_price + (atr_val * 1.5)
         stop_price = round_to_tick(sl_raw, tick_size)
 
         sl_order_id = None
@@ -322,7 +329,6 @@ def execute_trade(symbol, mode, armed_data, current_price):
                 
             delta_request("POST", f"/v2/products/{rules['id']}/orders/leverage", body={"leverage": int(lev)}, authenticated=True)
             
-            # Atomic Bracket Order
             payload = {
                 "product_symbol": symbol, "size": qty, "side": "buy" if side == "LONG" else "sell",
                 "order_type": "market_order", "bracket_stop_loss_price": str(stop_price)
@@ -335,9 +341,9 @@ def execute_trade(symbol, mode, armed_data, current_price):
 
         with lock:
             state["current_trade"] = {
-                "symbol": symbol, "side": side, "entry": current_price, "quantity": qty,
+                "symbol": symbol, "side": side, "entry": execute_price, "quantity": qty,
                 "leverage": lev, "stop": stop_price, "entry_atr": atr_val,
-                "highest_price": current_price, "lowest_price": current_price, "mode": mode,
+                "highest_price": execute_price, "lowest_price": execute_price, "mode": mode,
                 "sl_order_id": sl_order_id,
                 "opened_at": datetime.now(IST).isoformat()
             }
@@ -345,7 +351,7 @@ def execute_trade(symbol, mode, armed_data, current_price):
         
         save_state()
         tp_str = f"{stop_price:.8f}".rstrip('0').rstrip('.')
-        event(f"🚀 {mode} EXECUTED: {symbol} {side} @ {current_price}. SL: {tp_str}")
+        event(f"🚀 {mode} EXECUTED: {symbol} {side} @ {execute_price}. SL: {tp_str}")
         return True
     except Exception as e:
         event(f"❌ Execution Error on {symbol}: {e}")
@@ -368,15 +374,24 @@ def sync_true_stateless():
                 side = "LONG" if size > 0 else "SHORT"
                 entry = float(active_pos.get("entry_price", 0))
                 
-                # Adopt orphan trade if memory was wiped
+                # Fetch open orders to find the active Stop Loss (Fixing the Duplicate SL Bug)
+                open_orders = delta_request("GET", "/v2/orders", params={"state": "open", "product_symbol": sym}, authenticated=True).get("result", [])
+                sl_id = None
+                sl_price = entry
+                for o in open_orders:
+                    if o.get("order_type") == "stop_order":
+                        sl_id = o.get("id")
+                        sl_price = float(o.get("stop_price", entry))
+                        break
+
                 if not state["current_trade"] or state["current_trade"]["symbol"] != sym:
                     state["current_trade"] = {
                         "symbol": sym, "side": side, "entry": entry, "quantity": abs(size),
-                        "leverage": 1, "stop": entry, "entry_atr": 0.001, # Placeholder
+                        "leverage": 1, "stop": sl_price, "entry_atr": 0.001, 
                         "highest_price": entry, "lowest_price": entry, "mode": "LIVE",
-                        "sl_order_id": None, "opened_at": datetime.now(IST).isoformat()
+                        "sl_order_id": sl_id, "opened_at": datetime.now(IST).isoformat()
                     }
-                    event(f"🔗 Recovered Orphan Trade: {sym} {side} from Delta")
+                    event(f"🔗 Recovered Orphan Trade: {sym}. Synced SL: {sl_price}")
             else:
                 if state["current_trade"] and state["current_trade"]["mode"] == "LIVE":
                     state["current_trade"] = None
@@ -510,11 +525,20 @@ def engine_loop():
                         with lock: state["coins"][sel]["enabled"], state["coins"][sel]["armed_signal"], state["selected_coin"] = False, None, None
                         event(f"⏳ {sel} Setup EXPIRED (20 mins). Disarmed.")
                     else:
-                        live_price = state["coins"][sel]["last_signal"].get("price")
-                        if live_price:
-                            if (arm["side"] == "LONG" and live_price >= arm["trigger_price"]) or \
-                               (arm["side"] == "SHORT" and live_price <= arm["trigger_price"]):
-                                execute_trade(sel, state["mode"], arm, live_price)
+                        sig_data = state["coins"][sel]["last_signal"]
+                        # FIX: SNIPER WICK BUG RESOLVED (Now checks High/Low instead of just Close)
+                        current_close = sig_data.get("price")
+                        current_high = sig_data.get("high")
+                        current_low = sig_data.get("low")
+                        
+                        if current_close and current_high and current_low:
+                            if arm["side"] == "LONG" and current_high >= arm["trigger_price"]:
+                                # Enter at the trigger price if it crossed, or close if it opened above
+                                exec_price = max(arm["trigger_price"], current_close) if current_close < arm["trigger_price"] else current_close
+                                execute_trade(sel, state["mode"], arm, exec_price)
+                            elif arm["side"] == "SHORT" and current_low <= arm["trigger_price"]:
+                                exec_price = min(arm["trigger_price"], current_close) if current_close > arm["trigger_price"] else current_close
+                                execute_trade(sel, state["mode"], arm, exec_price)
         except Exception: pass
         finally:
             runtime["is_scanning"] = False
@@ -524,8 +548,6 @@ def engine_loop():
 
 def start_engine():
     global engine_thread, engine_socket_lock
-    
-    # 100% GUNICORN MULTI-WORKER FIX (Socket Lock)
     try:
         engine_socket_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         engine_socket_lock.bind(("127.0.0.1", 47500))
@@ -576,7 +598,7 @@ def api_toggle(symbol):
             state["coins"][symbol.upper()]["enabled"] = True
             state["coins"][symbol.upper()]["armed_signal"] = {"side": sig["side"], "trigger_price": sig["trigger_price"], "expiry_time": time.time() + 1200, "atr": sig["atr"]}
         tp_str = f"{sig['trigger_price']:.8f}".rstrip('0').rstrip('.')
-        event(f"🔫 {symbol.upper()} ARMED. Breakout Target: {tp_str}")
+        event(f"🔫 {symbol.upper()} ARMED. Target: {tp_str}")
     else:
         with lock: state["coins"][symbol.upper()]["enabled"], state["coins"][symbol.upper()]["armed_signal"], state["selected_coin"] = False, None, None
         event(f"🛑 {symbol.upper()} DISARMED manually.")
